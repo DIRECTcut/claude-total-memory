@@ -12,7 +12,7 @@ set -e
 
 echo ""
 echo "======================================================="
-echo "  Claude Total Memory v4.0 — Codex CLI Installer"
+echo "  Claude Total Memory v5.0 — Codex CLI Installer"
 echo "======================================================="
 echo ""
 

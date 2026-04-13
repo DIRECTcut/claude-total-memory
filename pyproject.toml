@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-total-memory"
-version = "4.0.0"
-description = "Persistent memory MCP server for Claude Code and Codex CLI — 4-tier search, BM25 scoring, knowledge graph, self-improving agent, privacy stripping, branch-aware context, SSE live feed, web dashboard, and 20 tools"
+version = "5.0.0"
+description = "Persistent memory MCP server for Claude Code & Codex CLI with 32 tools: knowledge graph, episodic memory, cognitive engine, skill tracking, and self-improving agent"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-keywords = ["claude", "mcp", "memory", "ai", "llm", "claude-code", "codex", "openai", "persistent-memory"]
+authors = [
+    {name = "Vitalii", email = "vitalii@example.com"},
+]
+keywords = ["claude", "mcp", "memory", "ai", "llm", "claude-code"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -29,9 +32,12 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/vbcherepanov/claude-total-memory"
-Repository = "https://github.com/vbcherepanov/claude-total-memory"
-Issues = "https://github.com/vbcherepanov/claude-total-memory/issues"
+Homepage = "https://github.com/vitaliimacpro/claude-total-memory"
+Repository = "https://github.com/vitaliimacpro/claude-total-memory"
+Issues = "https://github.com/vitaliimacpro/claude-total-memory/issues"
+
+[project.scripts]
+claude-total-memory = "claude_total_memory.server:main_sync"
 
 [tool.setuptools.packages.find]
 where = ["."]

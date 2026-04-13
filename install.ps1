@@ -16,7 +16,7 @@ $ErrorActionPreference = "Stop"
 
 Write-Host ""
 Write-Host "=======================================================" -ForegroundColor Cyan
-Write-Host "  Claude Total Memory v4.0 — Installer (Windows)"       -ForegroundColor Cyan
+Write-Host "  Claude Total Memory v5.0 — Installer (Windows)"       -ForegroundColor Cyan
 Write-Host "=======================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -139,6 +139,7 @@ print('  OK: MCP server added to ' + settings_path)
 Write-Host "-> Step 4b: Registering hooks..." -ForegroundColor Yellow
 
 $HookSession = (Join-Path $InstallDir "hooks" "session-start.ps1").Replace("\", "/")
+$HookSessionEnd = (Join-Path $InstallDir "hooks" "session-end.ps1").Replace("\", "/")
 $HookStop = (Join-Path $InstallDir "hooks" "on-stop.ps1").Replace("\", "/")
 $HookBash = (Join-Path $InstallDir "hooks" "memory-trigger.ps1").Replace("\", "/")
 $HookWrite = (Join-Path $InstallDir "hooks" "auto-capture.ps1").Replace("\", "/")
@@ -159,19 +160,24 @@ hooks = settings['hooks']
 
 ps = 'powershell -ExecutionPolicy Bypass -File '
 
-hooks['SessionStart'] = [{'type': 'command', 'command': ps + '$HookSession'}]
-hooks['Stop'] = [{'type': 'command', 'command': ps + '$HookStop'}]
-
-post = []
-post.append({'type': 'command', 'command': ps + '$HookBash', 'matcher': 'Bash'})
-post.append({'type': 'command', 'command': ps + '$HookWrite', 'matcher': 'Write'})
-post.append({'type': 'command', 'command': ps + '$HookWrite', 'matcher': 'Edit'})
-hooks['PostToolUse'] = post
+hooks['SessionStart'] = [
+    {'matcher': '', 'hooks': [{'type': 'command', 'command': ps + '$HookSession'}]}
+]
+hooks['SessionEnd'] = [
+    {'matcher': '', 'hooks': [{'type': 'command', 'command': ps + '$HookSessionEnd'}]}
+]
+hooks['Stop'] = [
+    {'matcher': '', 'hooks': [{'type': 'command', 'command': ps + '$HookStop'}]}
+]
+hooks['PostToolUse'] = [
+    {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': ps + '$HookBash'}]},
+    {'matcher': 'Write|Edit', 'hooks': [{'type': 'command', 'command': ps + '$HookWrite'}]}
+]
 
 with open(settings_path, 'w') as f:
     json.dump(settings, f, indent=2)
 
-print('  OK: Hooks registered (SessionStart, Stop, PostToolUse:Bash/Write/Edit)')
+print('  OK: Hooks registered (SessionStart, SessionEnd, Stop, PostToolUse:Bash/Write|Edit)')
 "@
 
 # -- 5. Dashboard service (Windows Scheduled Task) --

@@ -1,38 +1,24 @@
 #!/usr/bin/env bash
+# ===========================================
+# Auto Capture Hook — Portable version
 #
-# PostToolUse:Write,Edit hook — suggest memory_observe after file changes
+# PostToolUse:Write|Edit — suggests memory_observe after file changes
 #
-# Add to ~/.claude/settings.json:
-#   "hooks": {
-#     "PostToolUse": [
-#       {
-#         "type": "command",
-#         "command": "/path/to/claude-total-memory/hooks/auto-capture.sh",
-#         "matcher": "Write"
-#       },
-#       {
-#         "type": "command",
-#         "command": "/path/to/claude-total-memory/hooks/auto-capture.sh",
-#         "matcher": "Edit"
-#       }
-#     ]
-#   }
+# Hook: PostToolUse (matcher: "Write|Edit")
+# ===========================================
 
-# Read tool input from stdin (JSON)
-INPUT=$(cat)
+source "$(dirname "$0")/lib/common.sh"
 
-# Extract tool name and file path
-TOOL_NAME=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_name',''))" 2>/dev/null)
-FILE_PATH=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('input',{}).get('file_path',''))" 2>/dev/null)
+TOOL_NAME=$(hook_get 'tool_name')
+FILE_PATH=$(hook_get 'tool_input.file_path')
 
 if [ -z "$TOOL_NAME" ] || [ -z "$FILE_PATH" ]; then
     exit 0
 fi
 
-# Only hint for non-trivial files
+# Skip config/doc files — usually not worth observing
 case "$FILE_PATH" in
     *.md|*.txt|*.log|*.json|*.yaml|*.yml|*.toml|*.lock|*.sum)
-        # Skip config/doc files — usually not worth observing
         exit 0
         ;;
 esac
