@@ -13,7 +13,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/vbcherepanov/claude-total-memory)](https://github.com/vbcherepanov/claude-total-memory/stargazers)
 [![PayPal](https://img.shields.io/badge/PayPal-Donate-blue.svg?logo=paypal)](https://paypal.me/VitaliiCherepanov)
 
-[Quick Start](#quick-start) · [Features](#features) · [20 MCP Tools](#mcp-tools) · [Dashboard](#web-dashboard) · [Self-Improving Agent](#self-improving-agent)
+[Quick Start](#quick-start) · [Features](#features) · [32 MCP Tools](#mcp-tools) · [Dashboard](#web-dashboard) · [Self-Improving Agent](#self-improving-agent) · [What's New in v5.0](#whats-new-in-v50)
 
 </div>
 
@@ -29,7 +29,7 @@
 | 🔴 Knowledge lost at context limit | 🟢 Persistent local database, no cloud, no API keys |
 | 🔴 No idea what happened last session | 🟢 Full session timeline with search |
 
-> **20 MCP tools** · **4-tier search** (FTS5 → semantic → fuzzy → graph) · **Self-improving agent** · **Web dashboard** · **Privacy stripping** · **Works with Claude Code + Codex CLI**
+> **32 MCP tools** · **4-tier search** (FTS5 -> semantic -> fuzzy -> graph) · **Knowledge graph** · **Episodic memory** · **Skill tracking** · **Self-improving agent** · **Web dashboard** · **Privacy stripping** · **Works with Claude Code + Codex CLI**
 
 ---
 
@@ -41,13 +41,16 @@
 | Self-improving agent | ✅ Error → Insight → Rule pipeline | ❌ | ❌ |
 | Knowledge types | 5 (decision, solution, lesson, fact, convention) | 1 (generic) | 1 (summary) |
 | Privacy stripping | ✅ Auto-redacts keys, tokens, emails | ❌ | ❌ |
-| Knowledge graph | ✅ Typed relations + graph expansion | ❌ | ❌ |
+| Knowledge graph | ✅ Typed relations + graph expansion + concept clusters | ❌ | ❌ |
+| Episodic memory | ✅ Rich session episodes with temporal recall | ❌ | ❌ |
+| Skill tracking | ✅ Agent competency levels + self-assessment | ❌ | ❌ |
+| Associative search | ✅ Concept-linked retrieval + context building | ❌ | ❌ |
 | Web dashboard | ✅ Stats, graph, live feed, SOUL rules | ❌ | ✅ Basic |
 | Decay scoring | ✅ Exponential + spaced repetition | ❌ | ❌ |
 | Deduplication | ✅ Jaccard + fuzzy | ❌ | ❌ |
 | Branch-aware | ✅ Filter by git branch | ❌ | ❌ |
 | Codex CLI support | ✅ Shared database | ❌ | ❌ |
-| MCP tools | 20 | 10 | 3 |
+| MCP tools | 32 | 10 | 3 |
 | Storage | SQLite + ChromaDB (local) | ChromaDB (local) | JSON files |
 
 ---
@@ -76,6 +79,26 @@
 - Version history with supersession chains
 - Knowledge graph with typed relations between records
 - Tag-based browsing and filtering
+
+**Knowledge Graph** (new in v5.0)
+- Deep graph traversal with configurable depth (`memory_graph`)
+- Concept cluster discovery across knowledge (`memory_concepts`)
+- Graph index rebuild and statistics (`memory_graph_index`, `memory_graph_stats`)
+
+**Episodic Memory** (new in v5.0)
+- Rich session episodes with titles, content, and temporal context
+- Episode recall with semantic search across past sessions
+- Complements knowledge records with narrative context
+
+**Skills & Competencies** (new in v5.0)
+- Track agent skill levels across domains (docker, testing, debugging, etc.)
+- Skill delta updates with reasons for change
+- Self-assessment across all tracked skills
+
+**Cognitive Engine** (new in v5.0)
+- Associative search: find conceptually linked knowledge (`memory_associate`)
+- Context building: assemble full task context from knowledge, episodes, rules, and skills (`memory_context_build`)
+- On-demand reflection: synthesize recent activity into insights (`memory_reflect_now`)
 
 **Privacy and Security** (new in v4.0)
 - Automatic redaction of sensitive data: API keys, JWTs, passwords, credit card numbers, emails, IP addresses
@@ -209,46 +232,24 @@ Restart Claude Code. You should see `memory` listed in the MCP servers. Run `mem
 
 ## MCP Tools
 
-### Core (5 tools)
+### Core Memory (12 tools)
 
 | Tool | Description |
 |------|-------------|
 | `memory_recall` | Search all past knowledge. 4-tier search with decay scoring. 3-level detail: compact, summary, full. Branch filtering. Token estimation. |
 | `memory_save` | Save knowledge with type, project, tags, context, and branch. Auto-deduplicates. Privacy stripping. |
 | `memory_update` | Find existing knowledge by search query, supersede it, create a new version. |
-| `memory_search_by_tag` | Browse all active knowledge matching a tag (partial match supported). |
-| `memory_observe` | Lightweight observation tracking for file changes and discoveries. No dedup, no embeddings, 30-day retention. |
-
-### Browsing and Analytics (3 tools)
-
-| Tool | Description |
-|------|-------------|
 | `memory_timeline` | Browse session history by number, date range, or keyword search. |
 | `memory_stats` | View statistics: knowledge counts, health score, storage size, config. |
-| `memory_export` | Export all knowledge as JSON for backup or migration. |
-
-### Lifecycle (3 tools)
-
-| Tool | Description |
-|------|-------------|
 | `memory_consolidate` | Find and merge duplicate/similar records. Supports dry run preview. |
+| `memory_export` | Export all knowledge as JSON for backup or migration. |
 | `memory_forget` | Apply retention policy: archive stale records, purge old archives. |
-| `memory_delete` | Soft-delete a knowledge record. Removes from search and vector store. |
-
-### Graph and Versioning (2 tools)
-
-| Tool | Description |
-|------|-------------|
-| `memory_relate` | Create typed relations between records (causal, solution, context, related, contradicts). |
 | `memory_history` | View the version chain for a record -- walk through how knowledge evolved. |
+| `memory_delete` | Soft-delete a knowledge record. Removes from search and vector store. |
+| `memory_relate` | Create typed relations between records (causal, solution, context, related, contradicts). |
+| `memory_search_by_tag` | Browse all active knowledge matching a tag (partial match supported). |
 
-### Extraction (1 tool)
-
-| Tool | Description |
-|------|-------------|
-| `memory_extract_session` | Process pending session transcripts. List, read, and mark as complete. |
-
-### Self-Improvement (6 tools, v3.0)
+### Self-Improvement (6 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -258,6 +259,40 @@ Restart Claude Code. You should see `memory` listed in the MCP servers. Run `mem
 | `self_patterns` | Analyze error patterns, promotion candidates, rule effectiveness, and improvement trends. Views: error_patterns, insight_candidates, rule_effectiveness, improvement_trend, full_report. |
 | `self_reflect` | Save session reflections for meta-observations about strategy and approach. Not for errors (use self_error_log). For process improvements and what to do differently. |
 | `self_rules_context` | Load active rules at session start. Returns rules filtered by project and scope. Call at beginning of every session, then rate rules after task completion. |
+
+### Knowledge Graph (4 tools, new in v5.0)
+
+| Tool | Description |
+|------|-------------|
+| `memory_graph` | Traverse the knowledge graph from a record. Configurable depth (N hops). Returns connected nodes and edge types. |
+| `memory_concepts` | Discover concept clusters related to a query. Groups knowledge by thematic similarity. |
+| `memory_graph_index` | Rebuild the graph index. Run after bulk imports or relation changes. |
+| `memory_graph_stats` | Graph metrics: total nodes, edges, connected components, density, most-connected records. |
+
+### Episodic Memory (2 tools, new in v5.0)
+
+| Tool | Description |
+|------|-------------|
+| `memory_episode_save` | Save a rich session episode with title, narrative content, tags, and temporal context. Complements knowledge records with story-like context. |
+| `memory_episode_recall` | Recall past episodes by semantic search. Returns episodes with temporal ordering and relevance scoring. |
+
+### Skills & Competencies (3 tools, new in v5.0)
+
+| Tool | Description |
+|------|-------------|
+| `memory_skill_get` | Get current skill level, history, and recent activity for a specific domain. |
+| `memory_skill_update` | Update a skill level with a delta and reason. Tracks progression over time. |
+| `memory_self_assess` | Self-assessment across all tracked skills. Returns skill map with levels and confidence. |
+
+### Advanced (5 tools)
+
+| Tool | Description |
+|------|-------------|
+| `memory_observe` | Lightweight observation tracking for file changes and discoveries. No dedup, no embeddings, 30-day retention. |
+| `memory_associate` | Associative search: find conceptually linked knowledge beyond keyword/semantic matching. Follows concept trails. (new in v5.0) |
+| `memory_context_build` | Build a full context bundle for a task: related knowledge, recent episodes, active rules, relevant skills. One call to prepare for any task. (new in v5.0) |
+| `memory_reflect_now` | Trigger an on-demand reflection: synthesize recent activity, knowledge gaps, and patterns into actionable insights. (new in v5.0) |
+| `memory_extract_session` | Process pending session transcripts. List, read, and mark as complete. |
 
 ---
 
@@ -784,26 +819,30 @@ Claude Code
     |
     | (MCP protocol over stdio)
     v
-+----------------------------------------------+
-|  MCP Server (server.py) — 20 tools            |
-|                                                |
-|  +--------+  +---------+  +-------+  +------+ |
-|  | Store   |  | Recall  |  | Self- |  | Obs. | |
-|  | (write) |  | (read)  |  | Impr. |  | (cap)| |
-|  +----+----+  +----+----+  +---+---+  +--+---+ |
-|       |            |           |          |    |
-|  +----v------------v-----------v----------v-+  |
-|  |   SQLite (8 tables + FTS5)               |  |
-|  |   + ChromaDB (vectors)                   |  |
-|  |   + Relations Graph                      |  |
-|  |   + Privacy Stripping                    |  |
-|  +------------------------------------------+  |
-+----------------------------------------------+
++-----------------------------------------------------------+
+|  MCP Server (server.py) -- 32 tools                       |
+|                                                           |
+|  +-------+ +-------+ +-------+ +-------+ +------+ +----+ |
+|  | Core  | | Self- | | Graph | | Epis- | | Skil | | Adv| |
+|  | Mem.  | | Impr. | |       | | odic  | | ls   | |    | |
+|  | (12)  | | (6)   | | (4)   | | (2)   | | (3)  | | (5)| |
+|  +---+---+ +---+---+ +---+---+ +---+---+ +--+---+ +-+--+ |
+|      |         |         |         |         |       |    |
+|  +---v---------v---------v---------v---------v-------v-+  |
+|  |   SQLite (10+ tables + FTS5)                        |  |
+|  |   + ChromaDB (vectors)                              |  |
+|  |   + Knowledge Graph                                 |  |
+|  |   + Privacy Stripping                               |  |
+|  +-------------------------------------------------+   |
++-----------------------------------------------------------+
 ```
 
-- **Store**: handles writes -- save, update, delete, consolidate, retention, dedup
-- **Recall**: handles reads -- 4-tier search, timeline browsing, statistics
-- **Self-Improvement**: handles learning -- error logging, pattern detection, insight management, rule lifecycle
+- **Core Memory** (12 tools): save, recall, update, delete, consolidate, timeline, stats, export, forget, history, relate, search by tag
+- **Self-Improvement** (6 tools): error logging, pattern detection, insight management, rule lifecycle, reflection, rules context
+- **Knowledge Graph** (4 tools): graph traversal, concept clusters, index management, graph statistics
+- **Episodic Memory** (2 tools): episode save and recall with temporal context
+- **Skills** (3 tools): skill tracking, delta updates, self-assessment
+- **Advanced** (5 tools): observations, associative search, context building, on-demand reflection, transcript extraction
 - **Dashboard** (`src/dashboard.py`): standalone HTTP server using Python stdlib, read-only SQLite access
 
 The server creates a new session ID on each startup and logs all tool calls to raw JSONL files for auditability.
@@ -911,7 +950,7 @@ Both Claude Code and Codex CLI point to the same `~/.claude-memory/` database. K
    (~/.claude/settings.json)  (~/.codex/config.toml)
               |                       |
               +--- Same server.py ----+
-              +--- Same 20 tools -----+
+              +--- Same 32 tools -----+
               +--- Same dashboard ----+
 ```
 
@@ -948,13 +987,75 @@ notify = ["/path/to/claude-total-memory/hooks/codex-notify.sh"]
 | Custom agents | `.claude/agents/*.md` | `.agents/skills/` |
 | Installer | `install.sh` / `install.ps1` | `install-codex.sh` / `install-codex.ps1` |
 | Override mechanism | None | `AGENTS.override.md` |
-| MCP tools | All 20 | All 20 (identical) |
+| MCP tools | All 32 | All 32 (identical) |
 | Dashboard | Shared | Shared |
 | Memory database | `~/.claude-memory/` | `~/.claude-memory/` (same) |
 
 ---
 
-## Upgrading from v3.x
+## What's New in v5.0
+
+Upgrading from v4.x (20 tools) to v5.0 (32 tools).
+
+### New Modules
+
+- **Knowledge Graph** (4 tools): deep graph traversal, concept cluster discovery, graph indexing and statistics
+- **Episodic Memory** (2 tools): rich session episodes with titles, narrative content, and temporal recall
+- **Skills & Competencies** (3 tools): track agent skill levels, delta updates with reasons, self-assessment
+- **Cognitive Engine** (3 tools): associative search, full context building for tasks, on-demand reflection
+
+### Upgrade Steps
+
+**1. Update the code**
+
+```bash
+cd /path/to/claude-total-memory
+git pull origin main
+```
+
+**2. Database migration**
+
+No manual migration needed. The server automatically creates new tables (`episodes`, `skills`, `graph_index`) on first startup. Existing data is untouched.
+
+**3. Install dependencies**
+
+No new Python dependencies required. All new modules use SQLite and the existing embedding infrastructure.
+
+**4. Dashboard**
+
+Restart the dashboard to see new tabs for Knowledge Graph explorer and Skill tracking:
+
+```bash
+# macOS
+launchctl bootout gui/$(id -u)/com.claude-total-memory.dashboard
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-total-memory.dashboard.plist
+```
+
+**5. Update templates**
+
+Copy updated `CLAUDE.md.template` / `AGENTS.md.template` to your projects to enable new tool instructions.
+
+### v5.0 Changelog
+
+- 12 new MCP tools (20 -> 32)
+- `memory_graph`: traverse knowledge graph with configurable depth
+- `memory_concepts`: discover concept clusters across knowledge
+- `memory_graph_index`: rebuild graph index on demand
+- `memory_graph_stats`: graph metrics (nodes, edges, density, components)
+- `memory_episode_save`: save rich session episodes
+- `memory_episode_recall`: recall episodes by semantic search
+- `memory_skill_get`: query skill levels and history
+- `memory_skill_update`: update skill levels with tracking
+- `memory_self_assess`: self-assessment across all skills
+- `memory_associate`: associative search beyond keyword/semantic
+- `memory_context_build`: assemble full task context in one call
+- `memory_reflect_now`: on-demand reflection and insight synthesis
+- Updated all templates for 32-tool coverage
+- Hooks format compatibility improvements
+
+---
+
+## Upgrading from v3.x to v4.0
 
 If you are upgrading from v3.x (19 tools) to v4.0 (20 tools):
 

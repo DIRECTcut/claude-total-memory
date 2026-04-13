@@ -21,6 +21,7 @@ import math
 import os
 import re
 import sqlite3
+import struct
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -43,13 +44,102 @@ try:
 except ImportError:
     HAS_ST = False
 
+try:
+    from fastembed import TextEmbedding
+    HAS_FASTEMBED = True
+except ImportError:
+    HAS_FASTEMBED = False
+
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+
+try:
+    from reranker import hyde_expand, rerank_results, analyze_query, multi_hop_expand, mmr_diversify
+    HAS_RERANKER = True
+except ImportError:
+    HAS_RERANKER = False
+
+try:
+    # Import cache early so it's available regardless of __file__ path tricks
+    _src_dir = str(Path(__file__).resolve().parent)
+    if _src_dir not in sys.path:
+        sys.path.insert(0, _src_dir)
+    from cache import QueryCache
+    HAS_CACHE = True
+except ImportError:
+    HAS_CACHE = False
+
 MEMORY_DIR = Path(os.environ.get("CLAUDE_MEMORY_DIR", os.path.expanduser("~/.claude-memory")))
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+FASTEMBED_MODEL = os.environ.get("FASTEMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+USE_OLLAMA_EMBED = os.environ.get("USE_OLLAMA_EMBED", "auto")  # auto|true|false
 DECAY_HALF_LIFE = int(os.environ.get("DECAY_HALF_LIFE", "90"))  # days
 ARCHIVE_AFTER_DAYS = int(os.environ.get("ARCHIVE_AFTER_DAYS", "180"))
 PURGE_AFTER_DAYS = int(os.environ.get("PURGE_AFTER_DAYS", "365"))
 OBSERVATION_RETENTION_DAYS = int(os.environ.get("OBSERVATION_RETENTION_DAYS", "30"))
+USE_ADVANCED_RAG = os.environ.get("USE_ADVANCED_RAG", "auto")  # auto|true|false — HyDE + reranker
+USE_BINARY_SEARCH = os.environ.get("USE_BINARY_SEARCH", "auto")  # auto|true|false — binary quantization
 LOG = lambda msg: sys.stderr.write(f"[memory-mcp] {msg}\n")
+
+# ── Super Memory v5 modules (lazy init) ──
+_v5_modules = {}
+
+
+def _get_v5(name, db):
+    """Lazy-init v5 modules to avoid import overhead on startup."""
+    if name not in _v5_modules:
+        _src = str(Path(__file__).parent)
+        if _src not in sys.path:
+            sys.path.insert(0, _src)
+        if name == "graph_store":
+            from graph.store import GraphStore
+            _v5_modules[name] = GraphStore(db)
+        elif name == "graph_query":
+            from graph.query import GraphQuery
+            _v5_modules[name] = GraphQuery(_get_v5("graph_store", db))
+        elif name == "graph_indexer":
+            from graph.indexer import GraphIndexer
+            _v5_modules[name] = GraphIndexer(db)
+        elif name == "graph_enricher":
+            from graph.enricher import GraphEnricher
+            _v5_modules[name] = GraphEnricher(db)
+        elif name == "activation":
+            from associative.activation import SpreadingActivation
+            _v5_modules[name] = SpreadingActivation(db)
+        elif name == "composition":
+            from associative.composition import CompositionEngine
+            _v5_modules[name] = CompositionEngine(db)
+        elif name == "assoc_recall":
+            from associative.recall import AssociativeRecall
+            _v5_modules[name] = AssociativeRecall(db, _get_v5("activation", db), _get_v5("composition", db))
+        elif name == "episodes":
+            from memory_systems.episode_store import EpisodeStore
+            _v5_modules[name] = EpisodeStore(db)
+        elif name == "skills":
+            from memory_systems.skill_store import SkillStore
+            _v5_modules[name] = SkillStore(db)
+        elif name == "self_model":
+            from memory_systems.self_model import SelfModel
+            _v5_modules[name] = SelfModel(db)
+        elif name == "reflection":
+            from reflection.agent import ReflectionAgent
+            _v5_modules[name] = ReflectionAgent(db)
+        elif name == "cognitive":
+            from cognitive.engine import CognitiveEngine
+            _v5_modules[name] = CognitiveEngine(db)
+        elif name == "ingestion":
+            from ingestion.gateway import IngestGateway
+            _v5_modules[name] = IngestGateway(db)
+        elif name == "extractor":
+            from ingestion.extractor import ConceptExtractor
+            _v5_modules[name] = ConceptExtractor(db)
+    return _v5_modules[name]
+
 
 # Privacy: patterns to redact before storing
 SENSITIVE_PATTERNS = [
@@ -83,7 +173,7 @@ class Store:
         self._check_fts()
 
         self.chroma = None
-        if HAS_CHROMA:
+        if HAS_CHROMA and USE_BINARY_SEARCH != "true":
             try:
                 c = chromadb.PersistentClient(path=str(MEMORY_DIR / "chroma"))
                 self.chroma = c.get_or_create_collection("knowledge", metadata={"hnsw:space": "cosine"})
@@ -91,6 +181,21 @@ class Store:
                 LOG(f"ChromaDB init: {e}")
 
         self._embedder = None
+        self._fastembed_model = None  # lazy init
+        self._ollama_available = None  # lazy check
+        self._binary_search_ready = None  # lazy check
+
+        # Query cache (LRU with TTL) — imported at top level
+        if HAS_CACHE:
+            self.cache = QueryCache(maxsize=200, default_ttl=300)
+            LOG("Query cache: enabled (200 entries, 5min TTL)")
+        else:
+            self.cache = None
+            LOG("Query cache: disabled (cache module not found)")
+
+        # Eagerly initialize embedding mode (not lazy)
+        self._embed_mode = self._init_embed_mode()
+        LOG(f"Embedding mode: {self._embed_mode}")
 
     @property
     def embedder(self):
@@ -101,13 +206,231 @@ class Store:
                 pass
         return self._embedder
 
-    def embed(self, texts):
-        if not self.embedder:
-            return None
+    @property
+    def fastembed(self):
+        """Lazy-init FastEmbed model."""
+        if self._fastembed_model is None and HAS_FASTEMBED:
+            try:
+                self._fastembed_model = TextEmbedding(FASTEMBED_MODEL)
+                LOG(f"FastEmbed: loaded {FASTEMBED_MODEL}")
+            except Exception as e:
+                LOG(f"FastEmbed: init failed ({e})")
+                self._fastembed_model = False  # sentinel to avoid retries
+        return self._fastembed_model if self._fastembed_model is not False else None
+
+    def _init_embed_mode(self):
+        """Eagerly determine embedding mode at startup.
+
+        Priority: FastEmbed → Ollama → SentenceTransformers
+        """
+        # Try FastEmbed first (fastest, no server dependency)
+        if HAS_FASTEMBED and self.fastembed:
+            return "fastembed"
+
+        if USE_OLLAMA_EMBED == "false":
+            self._ollama_available = False
+            if self.embedder:
+                return "st"
+            return "none"
+
+        # Check Ollama availability
+        if USE_OLLAMA_EMBED == "true" or USE_OLLAMA_EMBED == "auto":
+            if self._check_ollama():
+                return "ollama"
+
+        # Fallback to SentenceTransformers
+        if self.embedder:
+            return "st"
+        return "none"
+
+    def _check_ollama(self):
+        """Check if Ollama is running and has the embedding model."""
+        if self._ollama_available is not None:
+            return self._ollama_available
+        if USE_OLLAMA_EMBED == "false":
+            self._ollama_available = False
+            return False
         try:
-            return self.embedder.encode(texts).tolist()
-        except Exception:
+            import urllib.request
+            req = urllib.request.Request(f"{OLLAMA_URL}/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read())
+                models = [m.get("name", "").split(":")[0] for m in data.get("models", [])]
+                self._ollama_available = OLLAMA_EMBED_MODEL in models
+                if self._ollama_available:
+                    LOG(f"Ollama embed: available ({OLLAMA_EMBED_MODEL})")
+                else:
+                    LOG(f"Ollama embed: model '{OLLAMA_EMBED_MODEL}' not found (available: {models[:5]})")
+        except Exception as e:
+            self._ollama_available = False
+            LOG(f"Ollama embed: not available ({e})")
+        return self._ollama_available
+
+    def _ollama_embed(self, texts):
+        """Get embeddings via Ollama API."""
+        try:
+            import urllib.request
+            results = []
+            for text in texts:
+                payload = json.dumps({"model": OLLAMA_EMBED_MODEL, "prompt": text}).encode()
+                req = urllib.request.Request(
+                    f"{OLLAMA_URL}/api/embeddings",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                    results.append(data["embedding"])
+            return results
+        except Exception as e:
+            LOG(f"Ollama embed error: {e}")
             return None
+
+    def _fastembed_embed(self, texts):
+        """Get embeddings via FastEmbed (local, no server needed)."""
+        try:
+            # fastembed returns a generator, convert to list of lists
+            embeddings = list(self.fastembed.embed(texts))
+            return [emb.tolist() if hasattr(emb, 'tolist') else list(emb) for emb in embeddings]
+        except Exception as e:
+            LOG(f"FastEmbed error: {e}")
+            return None
+
+    def embed(self, texts):
+        """Get embeddings. Priority: FastEmbed → Ollama → SentenceTransformers."""
+        if self._embed_mode == "fastembed":
+            result = self._fastembed_embed(texts)
+            if result:
+                return result
+            # Fallback to Ollama if FastEmbed fails at runtime
+            if self._check_ollama():
+                return self._ollama_embed(texts)
+        if self._embed_mode == "ollama":
+            result = self._ollama_embed(texts)
+            if result:
+                return result
+            # Fallback to ST if Ollama fails at runtime
+        if self._embed_mode in ("st", "ollama", "fastembed") and self.embedder:
+            try:
+                return self.embedder.encode(texts).tolist()
+            except Exception:
+                pass
+        return None
+
+    # ── Binary Quantization ──
+
+    def _check_binary_search(self):
+        """Check if binary search is ready (embeddings table populated)."""
+        if self._binary_search_ready is not None:
+            return self._binary_search_ready
+        if USE_BINARY_SEARCH == "false":
+            self._binary_search_ready = False
+            return False
+        try:
+            count = self.db.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+            active = self.db.execute("SELECT COUNT(*) FROM knowledge WHERE status='active'").fetchone()[0]
+        except Exception:
+            self._binary_search_ready = False
+            return False
+        if USE_BINARY_SEARCH == "true":
+            self._binary_search_ready = count > 0
+        else:  # auto
+            self._binary_search_ready = active > 0 and count >= active * 0.8
+        if self._binary_search_ready:
+            LOG(f"Binary search: enabled ({count} embeddings for {active} active records)")
+        return self._binary_search_ready
+
+    @staticmethod
+    def _quantize_binary(embedding):
+        """Convert float32 embedding to packed binary vector (N-dim → N/8 bytes)."""
+        import numpy as np
+        arr = np.array(embedding, dtype=np.float32)
+        binary = np.where(arr > 0, 1, 0).astype(np.uint8)
+        return np.packbits(binary).tobytes()
+
+    @staticmethod
+    def _float32_to_blob(embedding):
+        """Convert float32 embedding list to BLOB."""
+        return struct.pack(f'{len(embedding)}f', *embedding)
+
+    @staticmethod
+    def _blob_to_float32(blob):
+        """Convert BLOB back to float32 list."""
+        n = len(blob) // 4
+        return list(struct.unpack(f'{n}f', blob))
+
+    def _upsert_embedding(self, knowledge_id, embedding, model_name):
+        """Store binary + float32 vectors for a knowledge record."""
+        binary_blob = self._quantize_binary(embedding)
+        float32_blob = self._float32_to_blob(embedding)
+        now = datetime.utcnow().isoformat() + "Z"
+        self.db.execute("""
+            INSERT OR REPLACE INTO embeddings (knowledge_id, binary_vector, float32_vector,
+                                               embed_model, embed_dim, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (knowledge_id, binary_blob, float32_blob, model_name, len(embedding), now))
+
+    def _delete_embedding(self, knowledge_id):
+        """Remove embedding for a knowledge record."""
+        self.db.execute("DELETE FROM embeddings WHERE knowledge_id=?", (knowledge_id,))
+
+    def _binary_search(self, query_embedding, n_candidates=50, project=None, n_results=10):
+        """Two-level binary quantization search: Hamming pre-filter → cosine re-rank."""
+        import numpy as np
+
+        # 1. Load binary vectors for active records
+        if project:
+            rows = self.db.execute("""
+                SELECT e.knowledge_id, e.binary_vector
+                FROM embeddings e JOIN knowledge k ON e.knowledge_id = k.id
+                WHERE k.status='active' AND k.project=?
+            """, (project,)).fetchall()
+        else:
+            rows = self.db.execute("""
+                SELECT e.knowledge_id, e.binary_vector
+                FROM embeddings e JOIN knowledge k ON e.knowledge_id = k.id
+                WHERE k.status='active'
+            """).fetchall()
+
+        if not rows:
+            return []
+
+        kid_list = [r[0] for r in rows]
+        bin_vecs = np.array([np.frombuffer(r[1], dtype=np.uint8) for r in rows])
+
+        # 2. Quantize query
+        q_binary = np.frombuffer(self._quantize_binary(query_embedding), dtype=np.uint8)
+
+        # 3. Hamming distance via XOR + popcount lookup table
+        popcount_lut = np.array([bin(i).count('1') for i in range(256)], dtype=np.int32)
+        xor_result = np.bitwise_xor(bin_vecs, q_binary)
+        hamming_distances = popcount_lut[xor_result].sum(axis=1)
+
+        # 4. Top-N candidates (lowest Hamming distance)
+        n_cand = min(n_candidates, len(kid_list))
+        top_indices = np.argpartition(hamming_distances, n_cand)[:n_cand]
+
+        # 5. Load float32 vectors for candidates → cosine re-rank
+        candidate_kids = [int(kid_list[i]) for i in top_indices]
+        placeholders = ",".join("?" * len(candidate_kids))
+        f32_rows = self.db.execute(
+            f"SELECT knowledge_id, float32_vector FROM embeddings WHERE knowledge_id IN ({placeholders})",
+            candidate_kids
+        ).fetchall()
+
+        q_vec = np.array(query_embedding, dtype=np.float32)
+        q_norm = np.linalg.norm(q_vec)
+
+        scored = []
+        for kid, f32_blob in f32_rows:
+            vec = np.frombuffer(f32_blob, dtype=np.float32)
+            cos_sim = float(np.dot(q_vec, vec) / (q_norm * np.linalg.norm(vec) + 1e-10))
+            scored.append((kid, cos_sim))
+
+        # 6. Sort by cosine similarity (descending), return top-k
+        scored.sort(key=lambda x: -x[1])
+        return scored[:n_results]
 
     def _schema(self):
         self.db.executescript("""
@@ -157,6 +480,14 @@ class Store:
                 INSERT INTO knowledge_fts(rowid,content,context,tags)
                 VALUES (new.id,new.content,new.context,new.tags);
             END;
+            CREATE TABLE IF NOT EXISTS embeddings (
+                knowledge_id INTEGER PRIMARY KEY,
+                binary_vector BLOB NOT NULL,
+                float32_vector BLOB NOT NULL,
+                embed_model TEXT NOT NULL,
+                embed_dim INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
         """)
         self.db.commit()
 
@@ -196,6 +527,20 @@ class Store:
         if "observations" not in tables:
             self._create_observations_table()
             LOG("Migration: created observations table")
+
+        # v4.1: Embeddings table for binary quantization
+        if "embeddings" not in tables:
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    knowledge_id INTEGER PRIMARY KEY,
+                    binary_vector BLOB NOT NULL,
+                    float32_vector BLOB NOT NULL,
+                    embed_model TEXT NOT NULL,
+                    embed_dim INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            LOG("Migration: created embeddings table for binary quantization")
 
         self.db.commit()
 
@@ -486,9 +831,13 @@ class Store:
         self.db.commit()
         rid = cur.lastrowid
 
-        if self.chroma:
-            embs = self.embed([f"{content} {context}"])
-            if embs:
+        embs = self.embed([f"{content} {context}"])
+        if embs:
+            model_name = FASTEMBED_MODEL if self._embed_mode == "fastembed" else (
+                OLLAMA_EMBED_MODEL if self._embed_mode == "ollama" else EMBEDDING_MODEL)
+            self._upsert_embedding(rid, embs[0], model_name)
+            self.db.commit()
+            if self.chroma and not self._check_binary_search():
                 try:
                     self.chroma.upsert(
                         ids=[str(rid)], embeddings=embs, documents=[content],
@@ -496,6 +845,14 @@ class Store:
                                     "session_id": sid, "created_at": now, "confidence": 1.0}])
                 except Exception:
                     pass
+        # Auto-link to knowledge graph
+        try:
+            from graph.auto_link import auto_link_knowledge
+            auto_link_knowledge(self.db, rid, content, project,
+                                tags if isinstance(tags, list) else json.loads(tags or "[]"))
+        except Exception as e:
+            LOG(f"Auto-link error: {e}")
+
         return rid, False, was_redacted
 
     def bump_recall(self, ids):
@@ -547,7 +904,8 @@ class Store:
                     "UPDATE knowledge SET status='consolidated', superseded_by=? WHERE id=?",
                     (longest["id"], r["id"]))
                 merged_ids.append(r["id"])
-                if self.chroma:
+                self._delete_embedding(r["id"])
+                if self.chroma and not self._check_binary_search():
                     try:
                         self.chroma.delete(ids=[str(r["id"])])
                     except Exception:
@@ -576,12 +934,15 @@ class Store:
 
         self.db.commit()
 
-        if self.chroma and (archived or purged):
+        if archived or purged:
             for r in self.q("SELECT id FROM knowledge WHERE status IN ('archived','purged')"):
-                try:
-                    self.chroma.delete(ids=[str(r["id"])])
-                except Exception:
-                    pass
+                self._delete_embedding(r["id"])
+                if self.chroma and not self._check_binary_search():
+                    try:
+                        self.chroma.delete(ids=[str(r["id"])])
+                    except Exception:
+                        pass
+            self.db.commit()
 
         return {"archived": archived, "purged": purged}
 
@@ -648,8 +1009,9 @@ class Store:
         if not rec:
             return None
         self.db.execute("UPDATE knowledge SET status='deleted' WHERE id=?", (kid,))
+        self._delete_embedding(kid)
         self.db.commit()
-        if self.chroma:
+        if self.chroma and not self._check_binary_search():
             try:
                 self.chroma.delete(ids=[str(kid)])
             except Exception:
@@ -1106,8 +1468,68 @@ class Recall:
     def __init__(self, store: Store):
         self.s = store
 
-    def search(self, query, project=None, ktype="all", limit=10, detail="full", branch=None):
-        results = {}
+    # ── RRF: Reciprocal Rank Fusion ──────────────────────────
+    # Default tier weights: semantic gets slight boost, fuzzy is penalized
+    RRF_K = 60  # standard RRF constant
+    RRF_WEIGHTS = {
+        "fts": 1.0,
+        "semantic": 1.2,
+        "hyde": 1.0,
+        "fuzzy": 0.5,
+        "graph": 0.8,
+    }
+
+    @staticmethod
+    def _rrf_fuse(tier_rankings, weights, k=60):
+        """Reciprocal Rank Fusion across multiple ranked lists.
+
+        Args:
+            tier_rankings: dict mapping tier name to list of doc IDs (ordered by tier score desc).
+            weights: dict mapping tier name to weight multiplier.
+            k: RRF smoothing constant (default 60).
+
+        Returns:
+            dict mapping doc_id to fused RRF score.
+        """
+        scores = {}
+        for source, ranked_ids in tier_rankings.items():
+            w = weights.get(source, 1.0)
+            for rank, doc_id in enumerate(ranked_ids):
+                scores[doc_id] = scores.get(doc_id, 0.0) + w * (1.0 / (k + rank + 1))
+        return scores
+
+    def _should_use_advanced_rag(self):
+        """Check if advanced RAG (HyDE + reranker) is available and enabled."""
+        if not HAS_RERANKER:
+            return False
+        if USE_ADVANCED_RAG == "false":
+            return False
+        if USE_ADVANCED_RAG == "true":
+            return True
+        # auto: check if Ollama is available
+        return self.s._check_ollama()
+
+    def search(self, query, project=None, ktype="all", limit=10, detail="full", branch=None, fusion="rrf",
+               rerank=False, diverse=False):
+        # Check cache first (include fusion param in cache key)
+        if self.s.cache is not None:
+            cache_key = self.s.cache.make_key(query=query, project=project, ktype=ktype,
+                                               limit=limit, detail=detail, branch=branch,
+                                               fusion=fusion, rerank=rerank, diverse=diverse)
+            cached = self.s.cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        use_advanced = self._should_use_advanced_rag()
+        query_info = None
+        if use_advanced:
+            query_info = analyze_query(query)
+
+        use_rrf = (fusion == "rrf")
+
+        # Collect results per doc_id and per-tier ranked lists for RRF
+        results = {}          # doc_id -> {"r": row, "score": legacy_score, "via": [tiers]}
+        tier_rankings = {}    # tier_name -> [doc_id, ...] ordered by tier-specific score desc
 
         # Tier 1: FTS5 keyword search with BM25 scoring
         fts_q = " OR ".join(Store._fts_escape(w) for w in re.split(r'\s+', query) if len(w) > 2) or Store._fts_escape(query)
@@ -1132,16 +1554,64 @@ class Recall:
             # Proper BM25 normalization: relative to max in batch
             raw_scores = [abs(dict(r).get("_bm25", 0)) for r in fts_rows]
             max_bm25 = max(raw_scores) if raw_scores else 1.0
+            fts_tier = []  # collect (doc_id, score) for RRF ranking
             for r in fts_rows:
                 row = dict(r)
                 bm25_raw = abs(row.pop("_bm25", 0))
                 bm25_score = (bm25_raw / max(max_bm25, 0.01)) * 2.0
                 results[r["id"]] = {"r": row, "score": max(0.5, bm25_score), "via": ["fts"]}
+                fts_tier.append(r["id"])  # already sorted by BM25 from SQL ORDER BY
+            if fts_tier:
+                tier_rankings["fts"] = fts_tier
         except Exception:
             pass
 
-        # Tier 2: Semantic search via ChromaDB
-        if self.s.chroma and self.s.embedder:
+        # ── Tier 2: Semantic search (binary quantization or ChromaDB fallback) ──
+        can_embed = self.s.fastembed or self.s.embedder or self.s._check_ollama()
+        semantic_tier = []   # (doc_id, score) for RRF
+        hyde_tier = []       # (doc_id, score) for RRF
+        if self.s._check_binary_search() and can_embed:
+            embs = self.s.embed([query])
+            if embs:
+                try:
+                    candidates = self.s._binary_search(
+                        embs[0], n_candidates=50, project=project, n_results=limit * 3)
+                    for kid, cos_sim in candidates:
+                        score = max(0, cos_sim)
+                        semantic_tier.append((kid, score))
+                        if kid in results:
+                            results[kid]["score"] += score
+                            results[kid]["via"].append("semantic")
+                        else:
+                            rec = self.s.q1("SELECT * FROM knowledge WHERE id=?", (kid,))
+                            if rec:
+                                results[kid] = {"r": rec, "score": score, "via": ["semantic"]}
+                except Exception:
+                    pass
+
+                # Tier 2b: HyDE with binary search
+                if use_advanced and query_info and query_info.get("expand"):
+                    try:
+                        hyde_emb = hyde_expand(query, project)
+                        if hyde_emb:
+                            candidates2 = self.s._binary_search(
+                                hyde_emb, n_candidates=50, project=project, n_results=limit * 2)
+                            for kid, cos_sim in candidates2:
+                                score = max(0, cos_sim) * 0.8
+                                hyde_tier.append((kid, score))
+                                if kid in results:
+                                    results[kid]["score"] += score * 0.5
+                                    if "hyde" not in results[kid]["via"]:
+                                        results[kid]["via"].append("hyde")
+                                else:
+                                    rec = self.s.q1("SELECT * FROM knowledge WHERE id=?", (kid,))
+                                    if rec:
+                                        results[kid] = {"r": rec, "score": score, "via": ["hyde"]}
+                    except Exception as e:
+                        LOG(f"HyDE search failed: {e}")
+
+        elif self.s.chroma and can_embed:
+            # Fallback: ChromaDB semantic search
             embs = self.s.embed([query])
             if embs:
                 where = {"status": "active"}
@@ -1154,6 +1624,7 @@ class Recall:
                     for i, rid_s in enumerate(cr["ids"][0]):
                         rid = int(rid_s)
                         score = max(0, 1.0 - cr["distances"][0][i])
+                        semantic_tier.append((rid, score))
                         if rid in results:
                             results[rid]["score"] += score
                             results[rid]["via"].append("semantic")
@@ -1164,7 +1635,38 @@ class Recall:
                 except Exception:
                     pass
 
-        # Tier 3: Fuzzy search (catches typos and partial matches)
+                # Tier 2b: HyDE (ChromaDB fallback)
+                if use_advanced and query_info and query_info.get("expand"):
+                    try:
+                        hyde_emb = hyde_expand(query, project)
+                        if hyde_emb:
+                            cr2 = self.s.chroma.query(
+                                query_embeddings=[hyde_emb], where=where,
+                                n_results=limit * 2, include=["distances", "documents", "metadatas"])
+                            for i, rid_s in enumerate(cr2["ids"][0]):
+                                rid = int(rid_s)
+                                score = max(0, 1.0 - cr2["distances"][0][i]) * 0.8
+                                hyde_tier.append((rid, score))
+                                if rid in results:
+                                    results[rid]["score"] += score * 0.5
+                                    if "hyde" not in results[rid]["via"]:
+                                        results[rid]["via"].append("hyde")
+                                else:
+                                    rec = self.s.q1("SELECT * FROM knowledge WHERE id=?", (rid,))
+                                    if rec:
+                                        results[rid] = {"r": rec, "score": score, "via": ["hyde"]}
+                    except Exception as e:
+                        LOG(f"HyDE search failed: {e}")
+
+        # Store semantic/hyde tier rankings (sorted by score desc for RRF)
+        if semantic_tier:
+            semantic_tier.sort(key=lambda x: x[1], reverse=True)
+            tier_rankings["semantic"] = [doc_id for doc_id, _ in semantic_tier]
+        if hyde_tier:
+            hyde_tier.sort(key=lambda x: x[1], reverse=True)
+            tier_rankings["hyde"] = [doc_id for doc_id, _ in hyde_tier]
+
+        # ── Tier 3: Fuzzy search (catches typos and partial matches) ──
         if len(results) < limit:
             try:
                 conds2 = ["k.status='active'"]
@@ -1184,35 +1686,104 @@ class Recall:
                     ORDER BY last_confirmed DESC LIMIT ?
                 """, params2)
                 ql = query.lower()
+                fuzzy_tier = []
                 for r in candidates:
                     if r["id"] in results:
                         continue
                     ratio = SequenceMatcher(None, ql, r["content"][:200].lower()).ratio()
                     if ratio > 0.35:
                         results[r["id"]] = {"r": r, "score": ratio * 0.6, "via": ["fuzzy"]}
+                        fuzzy_tier.append((r["id"], ratio))
+                if fuzzy_tier:
+                    fuzzy_tier.sort(key=lambda x: x[1], reverse=True)
+                    tier_rankings["fuzzy"] = [doc_id for doc_id, _ in fuzzy_tier]
             except Exception:
                 pass
 
-        # Tier 4: Graph expansion (1 hop from top 5)
+        # ── Tier 4: Graph expansion ──
         top5 = sorted(results, key=lambda x: results[x]["score"], reverse=True)[:5]
-        for kid in top5:
-            for r in self.s.q("""
-                SELECT k.* FROM relations rel
-                JOIN knowledge k ON k.id = CASE WHEN rel.from_id=? THEN rel.to_id ELSE rel.from_id END
-                WHERE (rel.from_id=? OR rel.to_id=?) AND k.status='active'
-            """, (kid, kid, kid)):
-                if r["id"] not in results:
-                    results[r["id"]] = {"r": r, "score": results[kid]["score"] * 0.4, "via": ["graph"]}
+        graph_tier = []
+        if use_advanced and query_info and query_info.get("deep_graph"):
+            # Multi-hop graph traversal (2 hops for architecture queries)
+            before_ids = set(results.keys())
+            multi_hop_expand(self.s, top5, results, depth=2)
+            # Collect newly added graph results for RRF tier ranking
+            for did in results:
+                if did not in before_ids:
+                    graph_tier.append((did, results[did]["score"]))
+        else:
+            # Standard 1-hop expansion
+            for kid in top5:
+                for r in self.s.q("""
+                    SELECT k.* FROM relations rel
+                    JOIN knowledge k ON k.id = CASE WHEN rel.from_id=? THEN rel.to_id ELSE rel.from_id END
+                    WHERE (rel.from_id=? OR rel.to_id=?) AND k.status='active'
+                """, (kid, kid, kid)):
+                    if r["id"] not in results:
+                        graph_score = results[kid]["score"] * 0.4
+                        results[r["id"]] = {"r": r, "score": graph_score, "via": ["graph"]}
+                        graph_tier.append((r["id"], graph_score))
 
-        # Apply decay scoring
+        if graph_tier:
+            graph_tier.sort(key=lambda x: x[1], reverse=True)
+            tier_rankings["graph"] = [doc_id for doc_id, _ in graph_tier]
+
+        # ── Apply decay scoring ──
         for item in results.values():
             lc = item["r"].get("last_confirmed", "")
             decay = Store._decay_factor(lc, DECAY_HALF_LIFE)
             recall_boost = min(0.3, (item["r"].get("recall_count", 0) or 0) * 0.05)
-            item["score"] *= (decay + recall_boost)
+            item["decay_factor"] = decay + recall_boost
 
-        # Rank, group, and bump recall counts
-        ranked = sorted(results.values(), key=lambda x: x["score"], reverse=True)[:limit]
+        # ── Score fusion: RRF or legacy ──
+        if use_rrf and tier_rankings:
+            # Compute RRF scores across all tiers
+            rrf_scores = self._rrf_fuse(tier_rankings, self.RRF_WEIGHTS, self.RRF_K)
+
+            # Apply decay to RRF scores and store both scores
+            for doc_id, rrf_sc in rrf_scores.items():
+                if doc_id in results:
+                    results[doc_id]["rrf_score"] = rrf_sc * results[doc_id]["decay_factor"]
+                    results[doc_id]["score"] *= results[doc_id]["decay_factor"]
+
+            # Documents not in any tier ranking (shouldn't happen, but safety net)
+            for doc_id, item in results.items():
+                if "rrf_score" not in item:
+                    item["score"] *= item["decay_factor"]
+                    item["rrf_score"] = item["score"] * 0.5  # penalized fallback
+
+            # Sort by fused RRF score
+            ranked = sorted(results.values(), key=lambda x: x.get("rrf_score", 0), reverse=True)[:limit * 2]
+        else:
+            # Legacy: apply decay to additive scores
+            for item in results.values():
+                item["score"] *= item["decay_factor"]
+            ranked = sorted(results.values(), key=lambda x: x["score"], reverse=True)[:limit * 2]
+
+        # Stage 5 (optional): CrossEncoder re-ranking
+        # CE is trained on MS-MARCO (web search) — helps for precision in large bases,
+        # but can hurt recall on conversational data. Off by default.
+        if rerank and HAS_RERANKER and len(ranked) > 1:
+            try:
+                ranked = rerank_results(query, ranked, top_k=limit)
+            except Exception as e:
+                LOG(f"Reranker failed, using original ranking: {e}")
+                ranked = ranked[:limit]
+        else:
+            ranked = ranked[:limit]
+
+        # Stage 6 (optional): MMR diversity
+        # Useful for broad queries ("what do I know about X") to get different aspects.
+        # Off by default — hurts recall when similar docs contain the answer.
+        if diverse and HAS_RERANKER and len(ranked) > 1:
+            try:
+                contents = [item["r"].get("content", "")[:300] for item in ranked]
+                embs = self.s.embed(contents)
+                if embs and len(embs) == len(ranked):
+                    ranked = mmr_diversify(ranked, embs, top_k=limit)
+            except Exception as e:
+                LOG(f"MMR diversify failed, using original order: {e}")
+
         returned_ids = [item["r"]["id"] for item in ranked]
         if returned_ids:
             self.s.bump_recall(returned_ids)
@@ -1243,6 +1814,8 @@ class Recall:
                     "score": round(item["score"], 3),
                     "created_at": r.get("created_at", ""),
                 }
+                if "rrf_score" in item:
+                    entry["rrf_score"] = round(item["rrf_score"], 6)
                 est = Store._estimate_tokens(json.dumps(entry))
                 entry["_tokens"] = est
                 total_tokens += est
@@ -1259,6 +1832,8 @@ class Recall:
                     "recall_count": r.get("recall_count", 0),
                     "decay": round(Store._decay_factor(r.get("last_confirmed", ""), DECAY_HALF_LIFE), 3),
                 }
+                if "rrf_score" in item:
+                    entry["rrf_score"] = round(item["rrf_score"], 6)
                 est = Store._estimate_tokens(json.dumps(entry))
                 entry["_tokens"] = est
                 total_tokens += est
@@ -1274,13 +1849,26 @@ class Recall:
                     "decay": round(Store._decay_factor(r.get("last_confirmed", ""), DECAY_HALF_LIFE), 3),
                     "branch": r.get("branch", ""),
                 }
+                if "rrf_score" in item:
+                    entry["rrf_score"] = round(item["rrf_score"], 6)
                 est = Store._estimate_tokens(json.dumps(entry))
                 entry["_tokens"] = est
                 total_tokens += est
                 grouped[t].append(entry)
 
-        return {"query": query, "total": len(ranked), "detail": detail,
-                "total_tokens": total_tokens, "results": grouped}
+        result = {"query": query, "total": len(ranked), "detail": detail,
+                  "fusion": fusion, "total_tokens": total_tokens, "results": grouped}
+        if use_rrf and tier_rankings:
+            result["tiers_used"] = list(tier_rankings.keys())
+
+        # Cache the result
+        if self.s.cache is not None:
+            cache_key = self.s.cache.make_key(query=query, project=project, ktype=ktype,
+                                               limit=limit, detail=detail, branch=branch,
+                                               fusion=fusion, rerank=rerank, diverse=diverse)
+            self.s.cache.put(cache_key, result, project=project)
+
+        return result
 
     def timeline(self, query=None, session_number=None, sessions_ago=None,
                  date_from=None, date_to=None, project=None, limit=5):
@@ -1364,6 +1952,17 @@ class Recall:
         if chroma_dir.exists():
             chroma_mb = sum(f.stat().st_size for f in chroma_dir.rglob("*") if f.is_file()) / 1048576
 
+        # Binary quantization stats
+        try:
+            embed_count = s.db.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+            embed_bytes = s.db.execute(
+                "SELECT COALESCE(SUM(LENGTH(binary_vector) + LENGTH(float32_vector)), 0) FROM embeddings"
+            ).fetchone()[0]
+            embed_mb = embed_bytes / 1048576
+        except Exception:
+            embed_count = 0
+            embed_mb = 0
+
         return {
             "sessions": s.total_sessions(),
             "knowledge": {
@@ -1385,6 +1984,7 @@ class Recall:
                 "raw_logs": round(raw_mb, 1),
                 "sqlite": round(db_mb, 1),
                 "chroma": round(chroma_mb, 1),
+                "embeddings": round(embed_mb, 1),
                 "total": round(raw_mb + trans_mb + db_mb + chroma_mb, 1),
             },
             "config": {
@@ -1392,11 +1992,19 @@ class Recall:
                 "archive_after_days": ARCHIVE_AFTER_DAYS,
                 "purge_after_days": PURGE_AFTER_DAYS,
                 "embedding_model": EMBEDDING_MODEL,
+                "fastembed_model": FASTEMBED_MODEL,
+                "ollama_embed_model": OLLAMA_EMBED_MODEL,
+                "embed_mode": s._embed_mode or "not_initialized",
                 "has_chromadb": HAS_CHROMA,
+                "has_fastembed": HAS_FASTEMBED,
                 "has_sentence_transformers": HAS_ST,
+                "binary_search": USE_BINARY_SEARCH,
+                "binary_search_active": s._check_binary_search(),
+                "embeddings_count": embed_count,
             },
             "self_improvement": self._si_stats(s),
             "observations": self._obs_stats(s),
+            "cache": s.cache.stats() if s.cache is not None else {"enabled": False},
         }
 
     @staticmethod
@@ -1456,8 +2064,9 @@ async def list_tools():
         Tool(
             name="memory_recall",
             description="Search ALL memory: decisions, solutions, facts, lessons from ALL past sessions. "
-                        "Uses 4-tier search: FTS5 keyword → semantic (ChromaDB) → fuzzy → graph expansion. "
-                        "Results include decay scoring (recent = higher rank). Use BEFORE starting any task.",
+                        "6-stage pipeline: FTS5+BM25 → semantic → fuzzy → graph → (optional) CrossEncoder → (optional) MMR. "
+                        "Default: hybrid mode (BM25+semantic+RRF, 97.4% R@5 on LongMemEval). "
+                        "Use BEFORE starting any task.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1470,6 +2079,13 @@ async def list_tools():
                                "description": "Level of detail: 'compact' ~50 tokens/result (id+title+score), "
                                               "'summary' truncates content to 150 chars, 'full' returns everything"},
                     "branch": {"type": "string", "description": "Filter by git branch (also includes branch-agnostic records)"},
+                    "fusion": {"type": "string", "enum": ["rrf", "legacy"], "default": "rrf",
+                               "description": "Score fusion method: 'rrf' = Reciprocal Rank Fusion (better multi-tier ranking), "
+                                              "'legacy' = original additive scoring"},
+                    "rerank": {"type": "boolean", "default": False,
+                               "description": "Enable CrossEncoder re-ranking for higher precision (adds ~30ms latency)"},
+                    "diverse": {"type": "boolean", "default": False,
+                                "description": "Enable MMR diversity to reduce redundant results (useful for broad queries)"},
                 },
                 "required": ["query"],
             },
@@ -1793,6 +2409,171 @@ async def list_tools():
                 "required": ["tool_name", "summary"],
             },
         ),
+        # ═══ Super Memory v5.0 Tools ═══
+        Tool(
+            name="memory_associate",
+            description="Associative recall — brain-like spreading activation through knowledge graph. "
+                        "Finds memories through concept resonance, not keyword search. "
+                        "In 'composition' mode, finds minimum set of memories covering all needed concepts.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language query"},
+                    "mode": {"type": "string", "enum": ["recall", "composition"], "default": "recall",
+                             "description": "recall=find related, composition=build solution from parts"},
+                    "project": {"type": "string", "description": "Filter by project"},
+                    "max_results": {"type": "integer", "default": 10},
+                    "min_coverage": {"type": "number", "default": 0.7,
+                                     "description": "Min coverage for composition mode (0.0-1.0)"},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="memory_graph",
+            description="Query the unified knowledge graph. Returns neighborhood of a node: "
+                        "connected rules, skills, memories, concepts, entities.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name or ID to explore"},
+                    "depth": {"type": "integer", "default": 2, "description": "Traversal depth (1-3)"},
+                    "types": {"type": "array", "items": {"type": "string"},
+                              "description": "Filter by node types (rule, skill, concept, etc.)"},
+                },
+                "required": ["node"],
+            },
+        ),
+        Tool(
+            name="memory_concepts",
+            description="List or search concepts in the knowledge graph.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search concepts by name"},
+                    "type": {"type": "string", "description": "Filter by node type"},
+                    "limit": {"type": "integer", "default": 20},
+                    "include_memories": {"type": "boolean", "default": False,
+                                         "description": "Include linked knowledge records"},
+                },
+            },
+        ),
+        Tool(
+            name="memory_episode_save",
+            description="Save an episode — narrative of WHAT HAPPENED and HOW. "
+                        "Not just facts, but the journey: what was tried, what failed, what worked.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "narrative": {"type": "string", "description": "2-3 sentence narrative of what happened"},
+                    "outcome": {"type": "string", "enum": ["breakthrough", "failure", "routine", "discovery"]},
+                    "project": {"type": "string", "default": "general"},
+                    "impact_score": {"type": "number", "default": 0.5, "description": "0.0-1.0, how significant"},
+                    "concepts": {"type": "array", "items": {"type": "string"}, "description": "Key concepts involved"},
+                    "approaches_tried": {"type": "array", "items": {"type": "string"}},
+                    "key_insight": {"type": "string", "description": "The aha moment, if any"},
+                    "frustration_signals": {"type": "integer", "default": 0},
+                },
+                "required": ["narrative", "outcome"],
+            },
+        ),
+        Tool(
+            name="memory_episode_recall",
+            description="Find past episodes (experiences). Search by concepts, outcome, project, or impact.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search narrative text"},
+                    "project": {"type": "string"},
+                    "outcome": {"type": "string", "enum": ["breakthrough", "failure", "routine", "discovery"]},
+                    "min_impact": {"type": "number", "default": 0.0},
+                    "concepts": {"type": "array", "items": {"type": "string"}},
+                    "limit": {"type": "integer", "default": 10},
+                },
+            },
+        ),
+        Tool(
+            name="memory_skill_get",
+            description="Find skills matching a trigger. Skills are learned procedures — HOW to do things.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "trigger": {"type": "string", "description": "Natural language trigger to match"},
+                    "name": {"type": "string", "description": "Get skill by exact name"},
+                    "list_all": {"type": "boolean", "default": False},
+                },
+            },
+        ),
+        Tool(
+            name="memory_skill_update",
+            description="Record skill usage or refine a skill. Updates success rate and metrics.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "skill_id": {"type": "string", "description": "Skill ID"},
+                    "success": {"type": "boolean", "description": "Was the skill application successful?"},
+                    "notes": {"type": "string"},
+                    "new_steps": {"type": "array", "items": {"type": "string"}, "description": "Additional steps to add"},
+                    "new_anti_pattern": {"type": "string", "description": "Anti-pattern learned from failure"},
+                },
+                "required": ["skill_id", "success"],
+            },
+        ),
+        Tool(
+            name="memory_self_assess",
+            description="Self-assessment: how competent am I in given domains? Shows level, confidence, blind spots.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "concepts": {"type": "array", "items": {"type": "string"},
+                                 "description": "Domains/concepts to assess competency for"},
+                    "full_report": {"type": "boolean", "default": False,
+                                    "description": "Return full self-model report"},
+                },
+            },
+        ),
+        Tool(
+            name="memory_context_build",
+            description="Build optimal context for a query. Combines: spreading activation + knowledge graph "
+                        "+ episodes + skills + self-model. The 'brain thinking' tool.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What you need context for"},
+                    "project": {"type": "string"},
+                    "max_tokens": {"type": "integer", "default": 4000},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="memory_reflect_now",
+            description="Run reflection (the 'sleep' process). Consolidates knowledge, finds patterns, "
+                        "generates skill proposals, updates self-model.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["quick", "full", "weekly"], "default": "full",
+                              "description": "quick=dedup only, full=digest+synthesize, weekly=deep analysis"},
+                },
+            },
+        ),
+        Tool(
+            name="memory_graph_index",
+            description="Reindex CLAUDE.md rules and skills into the knowledge graph. "
+                        "Run after modifying CLAUDE.md or adding new skills.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "enum": ["all", "claude_md", "skills", "rules"], "default": "all"},
+                },
+            },
+        ),
+        Tool(
+            name="memory_graph_stats",
+            description="Knowledge graph statistics: nodes, edges, communities, top concepts, health metrics.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -1811,9 +2592,43 @@ async def _do(name, a):
     J = lambda x: json.dumps(x, ensure_ascii=False, indent=2, default=str)
 
     if name == "memory_recall":
-        return J(recall.search(a["query"], a.get("project"), a.get("type", "all"),
+        result = recall.search(a["query"], a.get("project"), a.get("type", "all"),
                                a.get("limit", 10), a.get("detail", "full"),
-                               a.get("branch")))
+                               a.get("branch"), a.get("fusion", "rrf"),
+                               a.get("rerank", False), a.get("diverse", False))
+
+        # Enrich with CognitiveEngine associative activation
+        try:
+            ce = _get_v5("cognitive", store.db)
+            cognitive_ctx = ce.on_query(a["query"], a.get("project"))
+            # Append cognitive enrichment to result
+            enrichment = {}
+            if cognitive_ctx.get("activated_concepts"):
+                enrichment["activated_concepts"] = cognitive_ctx["activated_concepts"][:10]
+            if cognitive_ctx.get("relevant_rules"):
+                enrichment["relevant_rules"] = cognitive_ctx["relevant_rules"]
+            if cognitive_ctx.get("past_failures"):
+                enrichment["past_failures"] = cognitive_ctx["past_failures"]
+            if cognitive_ctx.get("available_solutions"):
+                # Deduplicate against already-returned results
+                existing_ids = set()
+                for group in result.get("results", {}).values():
+                    for item in group:
+                        existing_ids.add(item.get("id"))
+                enrichment["additional_solutions"] = [
+                    s for s in cognitive_ctx["available_solutions"]
+                    if s.get("id") not in existing_ids
+                ][:5]
+            if cognitive_ctx.get("applicable_skills"):
+                enrichment["applicable_skills"] = cognitive_ctx["applicable_skills"]
+            if cognitive_ctx.get("competency"):
+                enrichment["competency"] = cognitive_ctx["competency"]
+            if enrichment:
+                result["cognitive"] = enrichment
+        except Exception as e:
+            LOG(f"CognitiveEngine enrichment error: {e}")
+
+        return J(result)
 
     elif name == "memory_timeline":
         kwargs = {k: a.get(k) for k in
@@ -1825,9 +2640,34 @@ async def _do(name, a):
             SID, a["content"], a["type"],
             a.get("project", "general"), a.get("tags", []), a.get("context", ""),
             branch=a.get("branch", BRANCH))
+        # Invalidate cache on write
+        if store.cache is not None:
+            store.cache.invalidate(project=a.get("project"))
         result = {"saved": True, "id": rid, "deduplicated": was_dedup}
         if was_redacted:
             result["privacy_redacted"] = True
+
+        # Auto-update SelfModel competencies for solution/lesson saves
+        if a["type"] in ("solution", "lesson") and not was_dedup:
+            try:
+                sm = _get_v5("self_model", store.db)
+                tags = a.get("tags", [])
+                # Extract domain concepts from tags (skip meta-tags)
+                meta_tags = frozenset({
+                    "reusable", "session-autosave", "context-recovery",
+                    "self-reflection", "auto", "manual",
+                })
+                domains = [t for t in tags if t not in meta_tags and len(t) >= 3]
+                outcome = "discovery" if a["type"] == "solution" else "routine"
+                competency_updates = []
+                for domain in domains[:5]:
+                    sm.update_competency(domain, outcome)
+                    competency_updates.append(domain)
+                if competency_updates:
+                    result["competency_updated"] = competency_updates
+            except Exception as e:
+                LOG(f"SelfModel competency update error: {e}")
+
         return J(result)
 
     elif name == "memory_update":
@@ -1847,12 +2687,16 @@ async def _do(name, a):
         store.db.execute(
             "UPDATE knowledge SET status='superseded',superseded_by=? WHERE id=?",
             (new_id, old["id"]))
+        store._delete_embedding(old["id"])
         store.db.commit()
-        if store.chroma:
+        if store.chroma and not store._check_binary_search():
             try:
                 store.chroma.delete(ids=[str(old["id"])])
             except Exception:
                 pass
+        # Invalidate cache on update
+        if store.cache is not None:
+            store.cache.invalidate(project=old_rec.get("project"))
         return J({"updated": True, "old_id": old["id"], "new_id": new_id})
 
     elif name == "memory_stats":
@@ -1937,6 +2781,9 @@ async def _do(name, a):
         rec = store.delete_knowledge(a["id"])
         if not rec:
             return J({"error": "Record not found", "id": a["id"]})
+        # Invalidate cache on delete
+        if store.cache is not None:
+            store.cache.invalidate(project=rec.get("project"))
         return J({"deleted": True, "id": a["id"], "content_preview": rec["content"][:100]})
 
     elif name == "memory_relate":
@@ -2078,6 +2925,143 @@ async def _do(name, a):
             a.get("project", "general"),
             branch=BRANCH)
         return J({"observed": True, "id": obs_id})
+
+    # ═══ Super Memory v5.0 Handlers ═══
+
+    elif name == "memory_associate":
+        ar = _get_v5("assoc_recall", store.db)
+        return J(ar.recall(
+            query=a["query"],
+            project=a.get("project"),
+            mode=a.get("mode", "recall"),
+            max_results=a.get("max_results", 10),
+            min_coverage=a.get("min_coverage", 0.7),
+        ))
+
+    elif name == "memory_graph":
+        gs = _get_v5("graph_store", store.db)
+        gq = _get_v5("graph_query", store.db)
+        node_input = a["node"]
+        # Try find by name first, then by ID
+        node = gs.get_node_by_name(node_input)
+        if not node:
+            node = gs.get_node(node_input)
+        if not node:
+            return J({"error": f"Node not found: {node_input}"})
+        result = gq.neighborhood(node["id"], depth=a.get("depth", 2),
+                                  types=a.get("types"))
+        result["center"] = node
+        return J(result)
+
+    elif name == "memory_concepts":
+        gs = _get_v5("graph_store", store.db)
+        query = a.get("query")
+        node_type = a.get("type")
+        limit = a.get("limit", 20)
+        if query:
+            nodes = gs.search_nodes(query, type=node_type, limit=limit)
+        else:
+            nodes = gs.get_nodes(type=node_type or "concept", limit=limit)
+        if a.get("include_memories"):
+            for n in nodes:
+                n["memories"] = gs.get_node_knowledge(n["id"])
+        return J({"concepts": nodes, "total": len(nodes)})
+
+    elif name == "memory_episode_save":
+        es = _get_v5("episodes", store.db)
+        eid = es.save(
+            session_id=SID,
+            narrative=a["narrative"],
+            outcome=a["outcome"],
+            project=a.get("project", "general"),
+            impact_score=a.get("impact_score", 0.5),
+            concepts=a.get("concepts"),
+            approaches_tried=a.get("approaches_tried"),
+            key_insight=a.get("key_insight"),
+            frustration_signals=a.get("frustration_signals", 0),
+        )
+        # Auto-extract and link concepts to graph
+        if a.get("concepts"):
+            ex = _get_v5("extractor", store.db)
+            ex.extract_and_link(a["narrative"], deep=False)
+        return J({"saved": True, "episode_id": eid})
+
+    elif name == "memory_episode_recall":
+        es = _get_v5("episodes", store.db)
+        return J({"episodes": es.find_similar(
+            query=a.get("query"),
+            project=a.get("project"),
+            outcome=a.get("outcome"),
+            min_impact=a.get("min_impact", 0.0),
+            concepts=a.get("concepts"),
+            limit=a.get("limit", 10),
+        )})
+
+    elif name == "memory_skill_get":
+        ss = _get_v5("skills", store.db)
+        if a.get("name"):
+            skill = ss.get_by_name(a["name"])
+            return J({"skill": skill} if skill else {"error": "Skill not found"})
+        if a.get("list_all"):
+            return J({"skills": ss.get_all()})
+        if a.get("trigger"):
+            matches = ss.match_trigger(a["trigger"])
+            return J({"skills": matches, "total": len(matches)})
+        return J({"skills": ss.get_all()})
+
+    elif name == "memory_skill_update":
+        ss = _get_v5("skills", store.db)
+        use_id = ss.record_use(a["skill_id"], a["success"], notes=a.get("notes"))
+        if a.get("new_steps") or a.get("new_anti_pattern"):
+            ss.refine(a["skill_id"], new_steps=a.get("new_steps"),
+                      new_anti_pattern=a.get("new_anti_pattern"))
+        skill = ss.get(a["skill_id"])
+        return J({"updated": True, "use_id": use_id, "skill": skill})
+
+    elif name == "memory_self_assess":
+        sm = _get_v5("self_model", store.db)
+        if a.get("full_report"):
+            return J(sm.full_report())
+        concepts = a.get("concepts", [])
+        return J(sm.assess(concepts))
+
+    elif name == "memory_context_build":
+        ce = _get_v5("cognitive", store.db)
+        return J(ce.build_context(
+            query=a["query"],
+            project=a.get("project"),
+            max_tokens=a.get("max_tokens", 4000),
+        ))
+
+    elif name == "memory_reflect_now":
+        ra = _get_v5("reflection", store.db)
+        scope = a.get("scope", "full")
+        if scope == "quick":
+            result = await ra.run_quick()
+        elif scope == "weekly":
+            result = await ra.run_weekly()
+        else:
+            result = await ra.run_full()
+        return J(result)
+
+    elif name == "memory_graph_index":
+        gi = _get_v5("graph_indexer", store.db)
+        target = a.get("target", "all")
+        if target == "all":
+            result = gi.reindex_all()
+        elif target == "claude_md":
+            result = gi.index_claude_md()
+        elif target == "skills":
+            result = gi.index_skills()
+        elif target == "rules":
+            result = gi.index_rules_dir()
+        else:
+            return J({"error": f"Unknown target: {target}"})
+        return J(result)
+
+    elif name == "memory_graph_stats":
+        ge = _get_v5("graph_enricher", store.db)
+        return J(ge.stats())
 
     return J({"error": "Unknown tool"})
 

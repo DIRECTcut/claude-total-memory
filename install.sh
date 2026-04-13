@@ -8,7 +8,7 @@ set -e
 
 echo ""
 echo "======================================================="
-echo "  Claude Total Memory v4.0 — Installer"
+echo "  Claude Total Memory v5.0 — Installer"
 echo "======================================================="
 echo ""
 
@@ -99,6 +99,7 @@ print('  OK: MCP server added to ' + settings_path)
 echo "-> Step 4b: Registering hooks..."
 
 HOOK_SESSION="$INSTALL_DIR/hooks/session-start.sh"
+HOOK_SESSION_END="$INSTALL_DIR/hooks/session-end.sh"
 HOOK_STOP="$INSTALL_DIR/hooks/on-stop.sh"
 HOOK_BASH="$INSTALL_DIR/hooks/memory-trigger.sh"
 HOOK_WRITE="$INSTALL_DIR/hooks/auto-capture.sh"
@@ -117,23 +118,31 @@ if 'hooks' not in settings:
 
 hooks = settings['hooks']
 
-# SessionStart
-hooks['SessionStart'] = [{'type': 'command', 'command': '$HOOK_SESSION'}]
+# SessionStart (matcher '' = all)
+hooks['SessionStart'] = [
+    {'matcher': '', 'hooks': [{'type': 'command', 'command': '$HOOK_SESSION'}]}
+]
 
-# Stop
-hooks['Stop'] = [{'type': 'command', 'command': '$HOOK_STOP'}]
+# SessionEnd (matcher '' = all)
+hooks['SessionEnd'] = [
+    {'matcher': '', 'hooks': [{'type': 'command', 'command': '$HOOK_SESSION_END'}]}
+]
 
-# PostToolUse — Bash + Write + Edit
-post = []
-post.append({'type': 'command', 'command': '$HOOK_BASH', 'matcher': 'Bash'})
-post.append({'type': 'command', 'command': '$HOOK_WRITE', 'matcher': 'Write'})
-post.append({'type': 'command', 'command': '$HOOK_WRITE', 'matcher': 'Edit'})
-hooks['PostToolUse'] = post
+# Stop (matcher '' = all)
+hooks['Stop'] = [
+    {'matcher': '', 'hooks': [{'type': 'command', 'command': '$HOOK_STOP'}]}
+]
+
+# PostToolUse — Bash + Write|Edit
+hooks['PostToolUse'] = [
+    {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': '$HOOK_BASH'}]},
+    {'matcher': 'Write|Edit', 'hooks': [{'type': 'command', 'command': '$HOOK_WRITE'}]}
+]
 
 with open(settings_path, 'w') as f:
     json.dump(settings, f, indent=2)
 
-print('  OK: Hooks registered (SessionStart, Stop, PostToolUse:Bash/Write/Edit)')
+print('  OK: Hooks registered (SessionStart, SessionEnd, Stop, PostToolUse:Bash/Write|Edit)')
 "
 
 # -- 5. Dashboard service (macOS LaunchAgent) --

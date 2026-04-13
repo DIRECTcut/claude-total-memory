@@ -89,20 +89,66 @@ Use `<private>...</private>` tags to explicitly exclude sensitive content:
 memory_save(content="Connected to <private>prod-host:5432</private>", type="fact", project="<project>")
 ```
 
-### Quick Reference
+### Quick Reference (32 tools)
+
+**Core Memory (12):**
 
 | Tool | Purpose |
 |------|---------|
 | `memory_recall` | Search past knowledge (4-tier: keyword, semantic, fuzzy, graph) |
 | `memory_save` | Store new knowledge with type, project, tags |
 | `memory_update` | Supersede existing knowledge with a new version |
-| `memory_search_by_tag` | Browse knowledge by tag |
-| `memory_observe` | Lightweight file change tracking (30-day retention) |
 | `memory_timeline` | Browse session history |
 | `memory_stats` | Health metrics and storage info |
+| `memory_consolidate` | Find and merge duplicate records |
+| `memory_export` | Export all knowledge as JSON |
+| `memory_forget` | Apply retention policy |
+| `memory_history` | View version chain for a record |
+| `memory_delete` | Soft-delete a record |
+| `memory_relate` | Create typed relations between records |
+| `memory_search_by_tag` | Browse knowledge by tag |
+
+**Self-Improvement (6):**
+
+| Tool | Purpose |
+|------|---------|
 | `self_error_log` | Log structured errors for pattern analysis |
 | `self_insight` | Manage insights (add/upvote/downvote/promote) |
 | `self_rules` | Manage behavioral rules (list/fire/rate/suspend) |
-| `self_rules_context` | Load active rules at session start |
 | `self_patterns` | Analyze error patterns and improvement trends |
 | `self_reflect` | Save session reflections |
+| `self_rules_context` | Load active rules at session start |
+
+**Knowledge Graph (4):**
+
+| Tool | Purpose |
+|------|---------|
+| `memory_graph` | Traverse knowledge graph from a record |
+| `memory_concepts` | Discover concept clusters |
+| `memory_graph_index` | Rebuild graph index |
+| `memory_graph_stats` | Graph metrics (nodes, edges, density) |
+
+**Episodic Memory (2):**
+
+| Tool | Purpose |
+|------|---------|
+| `memory_episode_save` | Save rich session episodes |
+| `memory_episode_recall` | Recall episodes by semantic search |
+
+**Skills & Competencies (3):**
+
+| Tool | Purpose |
+|------|---------|
+| `memory_skill_get` | Get skill level and history |
+| `memory_skill_update` | Update skill level with tracking |
+| `memory_self_assess` | Self-assessment across all skills |
+
+**Advanced (5):**
+
+| Tool | Purpose |
+|------|---------|
+| `memory_observe` | Lightweight file change tracking (30-day retention) |
+| `memory_associate` | Associative search across knowledge |
+| `memory_context_build` | Build full task context in one call |
+| `memory_reflect_now` | On-demand reflection and insight synthesis |
+| `memory_extract_session` | Process pending session transcripts |

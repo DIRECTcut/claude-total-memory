@@ -15,7 +15,9 @@ Environment:
 
 import json
 import os
+import socket
 import sqlite3
+import subprocess
 import sys
 import time
 import threading
@@ -232,25 +234,74 @@ def api_sessions(db: sqlite3.Connection, limit: int = 20) -> list[dict]:
     return sessions
 
 
-def api_graph(db: sqlite3.Connection) -> dict:
-    """Nodes and edges for the graph visualization."""
+def api_graph(db: sqlite3.Connection, limit: int = 1600) -> dict:
+    """Nodes and edges for the graph visualization with auto-generated edges."""
     nodes = q(
         db,
-        """SELECT id, type, project, substr(content, 1, 80) as label,
-                  recall_count, confidence
-           FROM knowledge
-           WHERE status='active'
+        """SELECT k.id, k.type, k.project, substr(k.content, 1, 120) as label,
+                  k.recall_count, k.confidence, k.tags, k.session_id
+           FROM knowledge k
+           WHERE k.status='active'
            ORDER BY recall_count DESC, created_at DESC
-           LIMIT 200""",
+           LIMIT ?""",
+        (limit,),
     )
 
     node_ids = {n["id"] for n in nodes}
 
+    # Explicit relations
     edges_raw = q(db, "SELECT from_id, to_id, type FROM relations")
     edges = [
         e for e in edges_raw
         if e["from_id"] in node_ids and e["to_id"] in node_ids
     ]
+    seen_pairs: set[tuple[int, int]] = {(e["from_id"], e["to_id"]) for e in edges}
+
+    # Auto-generate edges: same session = co-created
+    from collections import defaultdict
+    session_groups: dict[str, list[int]] = defaultdict(list)
+    tag_groups: dict[str, list[int]] = defaultdict(list)
+
+    for n in nodes:
+        if n["session_id"]:
+            session_groups[n["session_id"]].append(n["id"])
+        if n["tags"]:
+            try:
+                import json as _json
+                tags = _json.loads(n["tags"]) if isinstance(n["tags"], str) else n["tags"]
+                for t in tags:
+                    if t and t not in ("reusable", "session-summary", "session-autosave",
+                                       "context-recovery", "2026", "self-reflection"):
+                        tag_groups[t].append(n["id"])
+            except Exception:
+                pass
+
+    def add_edge(a: int, b: int, etype: str) -> None:
+        pair = (min(a, b), max(a, b))
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            edges.append({"from_id": a, "to_id": b, "type": etype})
+
+    # Session co-occurrence (max 3 edges per session to avoid clutter)
+    for sid, ids in session_groups.items():
+        if 2 <= len(ids) <= 8:
+            for i in range(min(len(ids) - 1, 3)):
+                add_edge(ids[i], ids[i + 1], "co-session")
+
+    # Tag co-occurrence (nodes sharing rare tags)
+    for tag, ids in tag_groups.items():
+        if 2 <= len(ids) <= 15:
+            for i in range(min(len(ids) - 1, 4)):
+                add_edge(ids[i], ids[i + 1], "shared-tag:" + tag)
+
+    # Same project links (connect top nodes within each project)
+    project_groups: dict[str, list[int]] = defaultdict(list)
+    for n in nodes:
+        project_groups[n["project"]].append(n["id"])
+    for proj, ids in project_groups.items():
+        if 2 <= len(ids):
+            for i in range(min(len(ids) - 1, 5)):
+                add_edge(ids[i], ids[i + 1], "same-project")
 
     return {"nodes": nodes, "edges": edges}
 
@@ -468,6 +519,259 @@ def api_branches(db: sqlite3.Connection) -> list[str]:
     except Exception:
         pass
     return sorted(branches)
+
+
+def api_graph_stats(db: sqlite3.Connection) -> dict:
+    """Graph statistics for Super Memory v5 dashboard."""
+    try:
+        nodes_by_type = dict(db.execute(
+            "SELECT type, COUNT(*) FROM graph_nodes WHERE status='active' GROUP BY type"
+        ).fetchall())
+        edges_by_type = dict(db.execute(
+            "SELECT relation_type, COUNT(*) FROM graph_edges GROUP BY relation_type"
+        ).fetchall())
+        total_nodes = sum(nodes_by_type.values()) if nodes_by_type else 0
+        total_edges = sum(edges_by_type.values()) if edges_by_type else 0
+        top_nodes = [dict(r) for r in db.execute(
+            "SELECT name, type, importance, mention_count FROM graph_nodes "
+            "WHERE status='active' ORDER BY importance DESC LIMIT 20"
+        ).fetchall()]
+        return {"total_nodes": total_nodes, "total_edges": total_edges,
+                "nodes_by_type": nodes_by_type, "edges_by_type": edges_by_type,
+                "top_nodes": top_nodes}
+    except Exception:
+        return {"total_nodes": 0, "total_edges": 0,
+                "nodes_by_type": {}, "edges_by_type": {},
+                "top_nodes": []}
+
+
+def api_graph_visual(db: sqlite3.Connection, limit: int = 100) -> dict:
+    """Graph nodes and edges from graph_nodes/graph_edges tables for vis.js visualization."""
+    try:
+        nodes = [dict(r) for r in db.execute(
+            """SELECT id, type, name, content, importance, mention_count, status
+               FROM graph_nodes
+               WHERE status='active'
+               ORDER BY importance DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()]
+
+        node_ids = {n["id"] for n in nodes}
+
+        all_edges = [dict(r) for r in db.execute(
+            """SELECT id, source_id, target_id, relation_type, weight, context
+               FROM graph_edges
+               ORDER BY weight DESC"""
+        ).fetchall()]
+
+        edges = [
+            e for e in all_edges
+            if e["source_id"] in node_ids and e["target_id"] in node_ids
+        ]
+
+        return {"nodes": nodes, "edges": edges}
+    except Exception as exc:
+        return {"nodes": [], "edges": [], "error": str(exc)}
+
+
+def api_graph_node_detail(db: sqlite3.Connection, node_id: str) -> dict | None:
+    """Get details for a single graph node including connected knowledge."""
+    try:
+        node = db.execute(
+            "SELECT * FROM graph_nodes WHERE id=?", (node_id,)
+        ).fetchone()
+        if not node:
+            return None
+        node = dict(node)
+
+        # Connected edges (both directions)
+        outgoing = [dict(r) for r in db.execute(
+            """SELECT e.relation_type, e.weight, e.context, n.name, n.type, n.id as target_id
+               FROM graph_edges e
+               JOIN graph_nodes n ON n.id = e.target_id
+               WHERE e.source_id = ?
+               ORDER BY e.weight DESC LIMIT 50""",
+            (node_id,),
+        ).fetchall()]
+
+        incoming = [dict(r) for r in db.execute(
+            """SELECT e.relation_type, e.weight, e.context, n.name, n.type, n.id as source_id
+               FROM graph_edges e
+               JOIN graph_nodes n ON n.id = e.source_id
+               WHERE e.target_id = ?
+               ORDER BY e.weight DESC LIMIT 50""",
+            (node_id,),
+        ).fetchall()]
+
+        return {
+            "node": node,
+            "outgoing": outgoing,
+            "incoming": incoming,
+        }
+    except Exception:
+        return None
+
+
+def api_system_status() -> dict:
+    """System status: LaunchAgents, memory stats, disk usage."""
+    # LaunchAgent statuses
+    agents: list[dict] = []
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if "claude.memory" in line or "claude-memory" in line:
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    agents.append({
+                        "pid": parts[0] if parts[0] != "-" else None,
+                        "exit_code": int(parts[1]) if parts[1] != "-" else None,
+                        "label": parts[2],
+                    })
+    except Exception as exc:
+        agents.append({"error": str(exc)})
+
+    # Memory stats
+    stats: dict = {}
+    try:
+        db = get_db()
+        if db:
+            stats["knowledge_count"] = db.execute(
+                "SELECT COUNT(*) FROM knowledge WHERE status='active'"
+            ).fetchone()[0]
+            try:
+                stats["graph_nodes"] = db.execute(
+                    "SELECT COUNT(*) FROM graph_nodes WHERE status='active'"
+                ).fetchone()[0]
+                stats["graph_edges"] = db.execute(
+                    "SELECT COUNT(*) FROM graph_edges"
+                ).fetchone()[0]
+            except Exception:
+                stats["graph_nodes"] = 0
+                stats["graph_edges"] = 0
+            try:
+                stats["last_reflection"] = db.execute(
+                    "SELECT MAX(created_at) FROM insights"
+                ).fetchone()[0]
+            except Exception:
+                stats["last_reflection"] = None
+            db.close()
+    except Exception:
+        pass
+
+    # Disk usage
+    disk: dict = {}
+    if DB_PATH.exists():
+        disk["db_mb"] = round(DB_PATH.stat().st_size / 1048576, 2)
+    chroma_dir = MEMORY_DIR / "chroma"
+    if chroma_dir.exists():
+        disk["chroma_mb"] = round(
+            sum(f.stat().st_size for f in chroma_dir.rglob("*") if f.is_file()) / 1048576, 2
+        )
+    disk["total_mb"] = round(sum(disk.values()), 2)
+
+    return {
+        "status": "running",
+        "port": DASHBOARD_PORT,
+        "launch_agents": agents,
+        "memory": stats,
+        "disk": disk,
+        "uptime_info": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def api_episodes(db: sqlite3.Connection) -> dict:
+    """Recent episodes for Super Memory v5 dashboard."""
+    try:
+        episodes = [dict(r) for r in db.execute(
+            "SELECT * FROM episodes ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()]
+        by_outcome = dict(db.execute(
+            "SELECT outcome, COUNT(*) FROM episodes GROUP BY outcome"
+        ).fetchall())
+        avg_impact = db.execute(
+            "SELECT AVG(impact_score) FROM episodes"
+        ).fetchone()[0] or 0
+        return {"episodes": episodes, "stats": {
+            "total": len(episodes),
+            "by_outcome": by_outcome,
+            "avg_impact": round(avg_impact, 2),
+        }}
+    except Exception:
+        return {"episodes": [], "stats": {"total": 0, "by_outcome": {}, "avg_impact": 0}}
+
+
+def api_skills(db: sqlite3.Connection) -> dict:
+    """All skills for Super Memory v5 dashboard."""
+    try:
+        skills = [dict(r) for r in db.execute(
+            "SELECT * FROM skills ORDER BY times_used DESC"
+        ).fetchall()]
+        # Enrich: extract description from projects JSON, parse stack
+        for sk in skills:
+            if sk.get("projects"):
+                try:
+                    proj = json.loads(sk["projects"]) if isinstance(sk["projects"], str) else sk["projects"]
+                    sk["description"] = proj.get("description", "")
+                    sk["source"] = proj.get("source", "")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if sk.get("stack") and isinstance(sk["stack"], str):
+                try:
+                    sk["stack_list"] = json.loads(sk["stack"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return {"skills": skills, "total": len(skills)}
+    except Exception:
+        return {"skills": [], "total": 0}
+
+
+def api_self_model(db: sqlite3.Connection) -> dict:
+    """Self model data for Super Memory v5 dashboard."""
+    try:
+        competencies = [dict(r) for r in db.execute(
+            "SELECT * FROM competencies ORDER BY level DESC"
+        ).fetchall()]
+    except Exception:
+        competencies = []
+
+    try:
+        blind_spots = [dict(r) for r in db.execute(
+            "SELECT * FROM blind_spots WHERE status IN ('active', 'monitoring')"
+        ).fetchall()]
+    except Exception:
+        blind_spots = []
+
+    try:
+        user_model = {r["key"]: {"value": r["value"], "confidence": r["confidence"]}
+                      for r in db.execute("SELECT * FROM user_model").fetchall()}
+    except Exception:
+        user_model = {}
+
+    return {"competencies": competencies, "blind_spots": blind_spots,
+            "user_model": user_model}
+
+
+def api_reflection(db: sqlite3.Connection) -> dict:
+    """Recent reflection reports for Super Memory v5 dashboard."""
+    try:
+        reports = [dict(r) for r in db.execute(
+            "SELECT * FROM reflection_reports ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()]
+    except Exception:
+        reports = []
+
+    try:
+        proposals = [dict(r) for r in db.execute(
+            "SELECT * FROM pending_proposals WHERE status='pending' ORDER BY created_at DESC"
+        ).fetchall()]
+    except Exception:
+        proposals = []
+
+    return {"reports": reports, "proposals": proposals}
 
 
 # ============================================================
@@ -848,13 +1152,113 @@ td.date-col { white-space: nowrap; color: var(--text-dim); font-size: 13px; }
 /* Graph */
 #graph-canvas {
     width: 100%;
-    height: 600px;
+    height: 700px;
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 12px;
     cursor: grab;
 }
 #graph-canvas:active { cursor: grabbing; }
+#graph-controls {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+#graph-controls button {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.2s;
+}
+#graph-controls button:hover { background: var(--border); }
+#graph-controls select {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 13px;
+}
+#graph-controls .graph-info {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--text-dim);
+}
+#graph-controls-row2 {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+#graph-controls-row2 button {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 5px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background 0.2s, border-color 0.2s;
+}
+#graph-controls-row2 button:hover { background: var(--border); }
+#graph-controls-row2 button.cluster-active {
+    background: var(--accent);
+    color: #000;
+    border-color: var(--accent);
+    font-weight: 600;
+}
+#graph-search {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 5px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    width: 200px;
+    outline: none;
+}
+#graph-search:focus { border-color: var(--accent); }
+#graph-search::placeholder { color: var(--text-dim); }
+#graph-controls-row2 select {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 5px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+}
+#graph-cluster-legend {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--text-dim);
+    min-height: 20px;
+}
+#graph-cluster-legend .cl-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: background 0.15s;
+}
+#graph-cluster-legend .cl-item:hover { background: var(--border); }
+#graph-cluster-legend .cl-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
 #graph-tooltip {
     display: none;
     position: absolute;
@@ -863,13 +1267,15 @@ td.date-col { white-space: nowrap; color: var(--text-dim); font-size: 13px; }
     border-radius: 8px;
     padding: 10px 14px;
     font-size: 13px;
-    max-width: 300px;
+    max-width: 350px;
     pointer-events: none;
     z-index: 500;
     box-shadow: 0 8px 32px rgba(0,0,0,0.4);
 }
 #graph-tooltip .tt-type { font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }
+#graph-tooltip .tt-project { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
 #graph-tooltip .tt-content { line-height: 1.5; }
+#graph-tooltip .tt-edges { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
 
 /* Loading / Error */
 .loading {
@@ -918,6 +1324,22 @@ td.date-col { white-space: nowrap; color: var(--text-dim); font-size: 13px; }
             <div class="label" id="stat-si-detail">-- errors, -- insights, -- rules</div>
         </div>
         <div class="stat-card"><div class="label">Observations</div><div class="value" id="stat-observations" style="color:var(--insight-color)">--</div></div>
+        <div class="stat-card">
+            <div class="label">Graph</div>
+            <div class="value" id="stat-graph" style="color: var(--accent)">--</div>
+            <div class="label" id="stat-graph-detail">-- nodes, -- edges</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Episodes</div>
+            <div class="value" id="stat-episodes" style="color: var(--solution)">--</div>
+            <div class="label" id="stat-episodes-detail">-- breakthroughs, -- failures</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Skills</div>
+            <div class="value" id="stat-skills" style="color: var(--decision)">--</div>
+            <div class="label" id="stat-skills-detail">avg success: --%</div>
+        </div>
+        <div class="stat-card"><div class="label">Blind Spots</div><div class="value" id="stat-blind-spots" style="color: var(--lesson)">--</div></div>
     </div>
 
     <div class="tabs">
@@ -926,7 +1348,13 @@ td.date-col { white-space: nowrap; color: var(--text-dim); font-size: 13px; }
         <button class="tab" data-tab="graph">Graph</button>
         <button class="tab" data-tab="self-improvement">Self-Improvement</button>
         <button class="tab" data-tab="rules">Rules (SOUL)</button>
+        <button class="tab" data-tab="v5-graph">Graph v5</button>
+        <button class="tab" data-tab="v5-episodes">Episodes</button>
+        <button class="tab" data-tab="v5-skills">Skills</button>
+        <button class="tab" data-tab="v5-self">Self Model</button>
+        <button class="tab" data-tab="v5-reflection">Reflection</button>
         <button class="tab" data-tab="live-feed">Live Feed</button>
+        <a href="/graph" class="tab" style="text-decoration:none" target="_blank">Interactive Graph &nearr;</a>
     </div>
 
     <!-- Knowledge Tab -->
@@ -980,10 +1408,48 @@ td.date-col { white-space: nowrap; color: var(--text-dim); font-size: 13px; }
 
     <!-- Graph Tab -->
     <div class="tab-content" id="tab-graph">
+        <div id="graph-controls">
+            <button onclick="graphZoom(1.3)" title="Zoom In">&#x1F50D;+ Zoom In</button>
+            <button onclick="graphZoom(0.7)" title="Zoom Out">&#x1F50D;- Zoom Out</button>
+            <button onclick="graphFitAll()" title="Fit All">Fit All</button>
+            <button onclick="graphRestart()" title="Re-layout">Re-layout</button>
+            <select id="graph-filter-project" onchange="graphFilterProject(this.value)">
+                <option value="">All Projects</option>
+            </select>
+            <label style="font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:4px;">
+                <input type="checkbox" id="graph-show-labels" checked onchange="graphToggleLabels(this.checked)"> Labels
+            </label>
+            <label style="font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:4px;">
+                <input type="checkbox" id="graph-show-edges" checked onchange="graphToggleEdges(this.checked)"> Edges
+            </label>
+            <span class="graph-info" id="graph-info">Loading...</span>
+        </div>
+        <div id="graph-controls-row2">
+            <span style="font-size:12px;color:var(--text-dim);font-weight:600;">Cluster:</span>
+            <button class="cluster-active" onclick="graphSetCluster('none')" id="cluster-btn-none">No Clustering</button>
+            <button onclick="graphSetCluster('project')" id="cluster-btn-project">By Project</button>
+            <button onclick="graphSetCluster('type')" id="cluster-btn-type">By Type</button>
+            <span style="width:1px;height:20px;background:var(--border);margin:0 4px;"></span>
+            <input type="text" id="graph-search" placeholder="Search nodes..." oninput="graphSearch(this.value)">
+            <select id="graph-filter-type" onchange="graphFilterType(this.value)">
+                <option value="">All Types</option>
+                <option value="fact">fact</option>
+                <option value="solution">solution</option>
+                <option value="decision">decision</option>
+                <option value="lesson">lesson</option>
+                <option value="convention">convention</option>
+            </select>
+            <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;">
+                <input type="checkbox" id="graph-show-hulls" checked onchange="graphToggleHulls(this.checked)"> Cluster Hulls
+            </label>
+        </div>
+        <div id="graph-cluster-legend"></div>
         <canvas id="graph-canvas"></canvas>
         <div id="graph-tooltip">
             <div class="tt-type"></div>
+            <div class="tt-project"></div>
             <div class="tt-content"></div>
+            <div class="tt-edges"></div>
         </div>
     </div>
 
@@ -1058,6 +1524,78 @@ td.date-col { white-space: nowrap; color: var(--text-dim); font-size: 13px; }
                 <tbody id="rules-body"></tbody>
             </table>
         </div>
+    </div>
+
+    <!-- Graph v5 Tab -->
+    <div class="tab-content" id="tab-v5-graph">
+        <h3 style="margin-bottom:16px;color:var(--accent)">Knowledge Graph</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">
+            <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px">
+                <h4 style="color:var(--text-dim);margin-bottom:12px;font-size:13px;text-transform:uppercase">Nodes by Type</h4>
+                <div id="v5-nodes-by-type"></div>
+            </div>
+            <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px">
+                <h4 style="color:var(--text-dim);margin-bottom:12px;font-size:13px;text-transform:uppercase">Edges by Type</h4>
+                <div id="v5-edges-by-type"></div>
+            </div>
+        </div>
+        <h4 style="color:var(--text-dim);margin-bottom:12px;font-size:13px;text-transform:uppercase">Top Nodes by Importance</h4>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>Name</th><th>Type</th><th>Importance</th><th>Mentions</th></tr>
+                </thead>
+                <tbody id="v5-top-nodes-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Episodes Tab -->
+    <div class="tab-content" id="tab-v5-episodes">
+        <h3 style="margin-bottom:16px;color:var(--solution)">Episodes Timeline</h3>
+        <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap" id="v5-episode-stats"></div>
+        <div id="v5-episodes-list" style="display:flex;flex-direction:column;gap:12px"></div>
+    </div>
+
+    <!-- Skills Tab -->
+    <div class="tab-content" id="tab-v5-skills">
+        <h3 style="margin-bottom:16px;color:var(--decision)">Skills Registry</h3>
+        <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;align-items:center">
+            <input type="text" id="v5-skills-search" placeholder="Search skills..." style="flex:1;min-width:200px;padding:8px 14px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px">
+            <select id="v5-skills-filter" style="padding:8px 14px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px">
+                <option value="">All types</option>
+                <option value="cmd:">Commands</option>
+                <option value="agent:">Agents</option>
+                <option value="rules:">Rules</option>
+            </select>
+            <span id="v5-skills-count" style="color:var(--text-dim);font-size:13px"></span>
+        </div>
+        <div id="v5-skills-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:16px"></div>
+    </div>
+
+    <!-- Self Model Tab -->
+    <div class="tab-content" id="tab-v5-self">
+        <h3 style="margin-bottom:16px;color:var(--convention)">Self Model</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
+            <div>
+                <h4 style="color:var(--text-dim);margin-bottom:12px;font-size:13px;text-transform:uppercase">Competencies</h4>
+                <div id="v5-competencies"></div>
+            </div>
+            <div>
+                <h4 style="color:var(--text-dim);margin-bottom:12px;font-size:13px;text-transform:uppercase">Blind Spots</h4>
+                <div id="v5-blind-spots"></div>
+                <h4 style="color:var(--text-dim);margin:20px 0 12px;font-size:13px;text-transform:uppercase">User Model</h4>
+                <div id="v5-user-model"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reflection Tab -->
+    <div class="tab-content" id="tab-v5-reflection">
+        <h3 style="margin-bottom:16px;color:var(--rule-color)">Reflection Reports</h3>
+        <div id="v5-reports" style="display:flex;flex-direction:column;gap:16px;margin-bottom:24px"></div>
+        <h4 style="color:var(--text-dim);margin-bottom:12px;font-size:13px;text-transform:uppercase">Pending Proposals</h4>
+        <div id="v5-proposals" style="display:flex;flex-direction:column;gap:12px"></div>
     </div>
 
     <!-- Live Feed Tab -->
@@ -1546,8 +2084,177 @@ async function loadSIStats() {
 }
 
 // ============================================================
-// Graph (simple force-directed, pure JS + Canvas)
+// Graph (force-directed with zoom/pan, clustering, pure JS + Canvas)
 // ============================================================
+let G = {};  // global graph state for control functions
+
+function graphZoom(factor) {
+    if (!G.canvas) return;
+    const cx = G.canvas.clientWidth / 2;
+    const cy = G.canvas.clientHeight / 2;
+    G.panX = cx - (cx - G.panX) * factor;
+    G.panY = cy - (cy - G.panY) * factor;
+    G.zoom *= factor;
+    G.drawGraph();
+}
+function graphFitAll() {
+    if (!G.nodes || !G.nodes.length) return;
+    let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
+    for (const n of G.visibleNodes()) {
+        minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+        minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+    }
+    const pad = 60;
+    const W = G.canvas.clientWidth;
+    const H = G.canvas.clientHeight;
+    const dx = maxX - minX || 1;
+    const dy = maxY - minY || 1;
+    G.zoom = Math.min((W - pad*2) / dx, (H - pad*2) / dy, 3);
+    G.panX = W/2 - (minX + dx/2) * G.zoom;
+    G.panY = H/2 - (minY + dy/2) * G.zoom;
+    G.drawGraph();
+}
+function graphRestart() {
+    if (!G.nodes) return;
+    G.clusterMode = 'none';
+    document.querySelectorAll('#graph-controls-row2 button[id^="cluster-btn"]').forEach(b => b.classList.remove('cluster-active'));
+    document.getElementById('cluster-btn-none').classList.add('cluster-active');
+    const spread = Math.sqrt(G.nodes.length) * 80;
+    for (const n of G.nodes) {
+        n.x = (Math.random() - 0.5) * spread;
+        n.y = (Math.random() - 0.5) * spread;
+        n.vx = 0; n.vy = 0;
+    }
+    G.runSimulation();
+}
+function graphFilterProject(project) {
+    G.filterProject = project || '';
+    G.drawGraph();
+    graphUpdateInfo();
+}
+function graphFilterType(type) {
+    G.filterType = type || '';
+    G.drawGraph();
+    graphUpdateInfo();
+}
+function graphToggleLabels(on) { G.showLabels = on; G.drawGraph(); }
+function graphToggleEdges(on) { G.showEdges = on; G.drawGraph(); }
+function graphToggleHulls(on) { G.showHulls = on; G.drawGraph(); }
+
+function graphSearch(query) {
+    G.searchQuery = (query || '').toLowerCase().trim();
+    G.drawGraph();
+    graphUpdateInfo();
+}
+
+function graphSetCluster(mode) {
+    if (!G.nodes) return;
+    G.clusterMode = mode;
+    // Update button states
+    document.querySelectorAll('#graph-controls-row2 button[id^="cluster-btn"]').forEach(b => b.classList.remove('cluster-active'));
+    document.getElementById('cluster-btn-' + mode).classList.add('cluster-active');
+
+    if (mode === 'none') {
+        // Reset cluster centers, re-run simulation
+        graphUpdateLegend([]);
+        G.runSimulation();
+        return;
+    }
+
+    // Compute cluster groups and arrange nodes radially
+    const groups = {};
+    for (const n of G.nodes) {
+        const key = mode === 'project' ? (n.project || 'unknown') : (n.type || 'unknown');
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(n);
+    }
+
+    const keys = Object.keys(groups).sort((a, b) => groups[b].length - groups[a].length);
+    const clusterColorMap = {};
+    const clPalette = [
+        '#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899',
+        '#06b6d4','#84cc16','#f97316','#6366f1','#14b8a6','#e11d48',
+        '#a855f7','#22c55e','#eab308','#0ea5e9','#d946ef','#64748b'
+    ];
+
+    // Arrange clusters in a circle
+    const totalNodes = G.nodes.length;
+    const baseRadius = Math.sqrt(totalNodes) * 18;
+    const angleStep = (2 * Math.PI) / keys.length;
+
+    keys.forEach((key, ki) => {
+        const angle = ki * angleStep - Math.PI / 2;
+        const cx = Math.cos(angle) * baseRadius;
+        const cy = Math.sin(angle) * baseRadius;
+        const nodesInGroup = groups[key];
+        const groupRadius = Math.sqrt(nodesInGroup.length) * 12;
+        clusterColorMap[key] = clPalette[ki % clPalette.length];
+
+        // Place nodes in this cluster around its center
+        nodesInGroup.forEach((n, ni) => {
+            const a2 = (ni / nodesInGroup.length) * 2 * Math.PI;
+            const r2 = groupRadius * Math.sqrt(ni / nodesInGroup.length);
+            n.x = cx + Math.cos(a2) * r2;
+            n.y = cy + Math.sin(a2) * r2;
+            n.vx = 0; n.vy = 0;
+            n.clusterKey = key;
+            n.clusterColor = clusterColorMap[key];
+        });
+    });
+
+    G.clusterColorMap = clusterColorMap;
+    G.clusterGroups = groups;
+
+    // Build legend
+    const legendItems = keys.map(k => ({
+        key: k,
+        color: clusterColorMap[k],
+        count: groups[k].length
+    }));
+    graphUpdateLegend(legendItems);
+
+    // Run a short simulation with cluster gravity
+    G.runClusteredSimulation(groups, clusterColorMap);
+}
+
+function graphUpdateLegend(items) {
+    const el = document.getElementById('graph-cluster-legend');
+    if (!items || !items.length) { el.innerHTML = ''; return; }
+    el.innerHTML = items.map(it =>
+        '<div class="cl-item" onclick="graphFocusCluster(\'' + it.key.replace(/'/g, "\\'") + '\')">' +
+        '<span class="cl-dot" style="background:' + it.color + '"></span>' +
+        '<span>' + it.key + ' (' + it.count + ')</span></div>'
+    ).join('');
+}
+
+function graphFocusCluster(key) {
+    if (!G.clusterGroups || !G.clusterGroups[key]) return;
+    const nodes = G.clusterGroups[key];
+    let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
+    for (const n of nodes) {
+        minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+        minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+    }
+    const pad = 80;
+    const W = G.canvas.clientWidth;
+    const H = G.canvas.clientHeight;
+    const dx = maxX - minX || 1;
+    const dy = maxY - minY || 1;
+    G.zoom = Math.min((W - pad*2) / dx, (H - pad*2) / dy, 5);
+    G.panX = W/2 - (minX + dx/2) * G.zoom;
+    G.panY = H/2 - (minY + dy/2) * G.zoom;
+    G.drawGraph();
+}
+
+function graphUpdateInfo() {
+    const vis = G.visibleNodes();
+    let text = vis.length + ' nodes, ' + G.visibleEdges().length + ' edges';
+    if (G.filterProject) text += ' [' + G.filterProject + ']';
+    if (G.filterType) text += ' [' + G.filterType + ']';
+    if (G.searchQuery) text += ' (search: "' + G.searchQuery + '")';
+    document.getElementById('graph-info').textContent = text;
+}
+
 function initGraph() {
     if (graphLoaded) return;
     graphLoaded = true;
@@ -1555,8 +2262,28 @@ function initGraph() {
     const canvas = document.getElementById('graph-canvas');
     const ctx = canvas.getContext('2d');
     const tooltip = document.getElementById('graph-tooltip');
-    const rect = canvas.parentElement.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
+
+    G.canvas = canvas;
+    G.ctx = ctx;
+    G.zoom = 1;
+    G.panX = 0;
+    G.panY = 0;
+    G.nodes = [];
+    G.edges = [];
+    G.showLabels = true;
+    G.showEdges = true;
+    G.showHulls = true;
+    G.filterProject = '';
+    G.filterType = '';
+    G.searchQuery = '';
+    G.clusterMode = 'none';
+    G.clusterColorMap = {};
+    G.clusterGroups = {};
+    G.hoveredNode = null;
+    G.dragNode = null;
+    G.isPanning = false;
+    G.lastMouse = {x:0, y:0};
 
     function resize() {
         const w = canvas.clientWidth;
@@ -1564,85 +2291,251 @@ function initGraph() {
         canvas.width = w * dpr;
         canvas.height = h * dpr;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        if (G.drawGraph) G.drawGraph();
     }
     resize();
     window.addEventListener('resize', resize);
 
-    let nodes = [];
-    let edges = [];
-    let hoveredNode = null;
-    let dragNode = null;
-    let offsetX = 0, offsetY = 0;
+    // Project color palette
+    const projectColors = {};
+    const projectPalette = [
+        '#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899',
+        '#06b6d4','#84cc16','#f97316','#6366f1','#14b8a6','#e11d48',
+        '#a855f7','#22c55e','#eab308','#0ea5e9','#d946ef','#64748b'
+    ];
+    let pIdx = 0;
+    function getProjectColor(proj) {
+        if (!projectColors[proj]) {
+            projectColors[proj] = projectPalette[pIdx % projectPalette.length];
+            pIdx++;
+        }
+        return projectColors[proj];
+    }
+
+    // Screen <-> world transforms
+    function toScreen(wx, wy) {
+        return { x: wx * G.zoom + G.panX, y: wy * G.zoom + G.panY };
+    }
+    function toWorld(sx, sy) {
+        return { x: (sx - G.panX) / G.zoom, y: (sy - G.panY) / G.zoom };
+    }
+
+    G.visibleNodes = function() {
+        let nodes = G.nodes;
+        if (G.filterProject) nodes = nodes.filter(n => n.project === G.filterProject);
+        if (G.filterType) nodes = nodes.filter(n => n.type === G.filterType);
+        if (G.searchQuery) nodes = nodes.filter(n =>
+            n.label.toLowerCase().includes(G.searchQuery) ||
+            (n.project || '').toLowerCase().includes(G.searchQuery) ||
+            (n.type || '').toLowerCase().includes(G.searchQuery)
+        );
+        return nodes;
+    };
+    G.visibleEdges = function() {
+        const vis = new Set(G.visibleNodes().map(n => n.id));
+        return G.edges.filter(e => vis.has(e.source.id) && vis.has(e.target.id));
+    };
+
+    // Build adjacency for tooltip
+    function getNodeEdges(node) {
+        return G.edges.filter(e => e.source.id === node.id || e.target.id === node.id);
+    }
+
+    // Convex hull (Graham scan) for cluster boundaries
+    function convexHull(points) {
+        if (points.length < 3) return points;
+        const pts = points.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+        const cross = (O, A, B) => (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
+        const lower = [];
+        for (const p of pts) {
+            while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], p) <= 0) lower.pop();
+            lower.push(p);
+        }
+        const upper = [];
+        for (let i = pts.length - 1; i >= 0; i--) {
+            while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], pts[i]) <= 0) upper.pop();
+            upper.push(pts[i]);
+        }
+        upper.pop(); lower.pop();
+        return lower.concat(upper);
+    }
 
     api('/api/graph').then(data => {
         graphData = data;
-        const W = canvas.clientWidth;
-        const H = canvas.clientHeight;
         const idMap = {};
+        const projects = new Set();
+        const types = new Set();
+        const spread = Math.sqrt(data.nodes.length) * 100;
 
-        nodes = data.nodes.map((n, i) => {
-            const angle = (2 * Math.PI * i) / data.nodes.length;
-            const r = Math.min(W, H) * 0.35;
+        G.nodes = data.nodes.map((n) => {
+            projects.add(n.project);
+            types.add(n.type);
             const node = {
                 id: n.id,
-                x: W / 2 + r * Math.cos(angle) + (Math.random() - 0.5) * 60,
-                y: H / 2 + r * Math.sin(angle) + (Math.random() - 0.5) * 60,
-                vx: 0,
-                vy: 0,
+                x: (Math.random() - 0.5) * spread,
+                y: (Math.random() - 0.5) * spread,
+                vx: 0, vy: 0,
                 type: n.type,
+                project: n.project || 'unknown',
                 label: n.label,
                 recall_count: n.recall_count || 0,
-                radius: Math.max(4, Math.min(12, 4 + (n.recall_count || 0))),
+                confidence: n.confidence || 0,
+                radius: Math.max(4, Math.min(14, 4 + Math.sqrt(n.recall_count || 0) * 2.5)),
                 color: typeColors[n.type] || '#64748b',
+                projectColor: getProjectColor(n.project || 'unknown'),
+                clusterKey: '',
+                clusterColor: '',
             };
             idMap[n.id] = node;
             return node;
         });
 
-        edges = data.edges.map(e => ({
+        G.edges = data.edges.map(e => ({
             source: idMap[e.from_id],
             target: idMap[e.to_id],
             type: e.type,
         })).filter(e => e.source && e.target);
 
-        simulate();
-    }).catch(() => {});
+        // Populate project filter
+        const sel = document.getElementById('graph-filter-project');
+        [...projects].sort().forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p; opt.textContent = p;
+            sel.appendChild(opt);
+        });
 
-    function simulate() {
+        // Populate type filter
+        const tsel = document.getElementById('graph-filter-type');
+        // Clear existing options except first
+        while (tsel.options.length > 1) tsel.remove(1);
+        [...types].sort().forEach(t => {
+            const opt = document.createElement('option');
+            opt.value = t; opt.textContent = t;
+            tsel.appendChild(opt);
+        });
+
+        graphUpdateInfo();
+        G.runSimulation();
+    }).catch(err => {
+        document.getElementById('graph-info').textContent = 'Error loading graph: ' + err.message;
+    });
+
+    // Barnes-Hut quad-tree for O(n log n) repulsion
+    function buildQuadTree(nodes) {
+        if (!nodes.length) return null;
+        let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
+        for (const n of nodes) {
+            minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+            minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+        }
+        const pad = 10;
+        const size = Math.max(maxX - minX, maxY - minY) + pad * 2;
+        const cx = (minX + maxX) / 2;
+        const cy = (minY + maxY) / 2;
+
+        function makeNode(x, y, s) { return {x, y, size: s, mass: 0, comX: 0, comY: 0, children: null, body: null}; }
+
+        function insert(tree, node) {
+            if (tree.mass === 0 && !tree.body) {
+                tree.body = node;
+                tree.mass = 1;
+                tree.comX = node.x;
+                tree.comY = node.y;
+                return;
+            }
+            if (tree.body) {
+                if (!tree.children) subdivide(tree);
+                const old = tree.body;
+                tree.body = null;
+                insertToChild(tree, old);
+            }
+            insertToChild(tree, node);
+            // Update center of mass
+            const newMass = tree.mass + 1;
+            tree.comX = (tree.comX * tree.mass + node.x) / newMass;
+            tree.comY = (tree.comY * tree.mass + node.y) / newMass;
+            tree.mass = newMass;
+        }
+
+        function subdivide(tree) {
+            const hs = tree.size / 2;
+            tree.children = [
+                makeNode(tree.x - hs/2, tree.y - hs/2, hs), // NW
+                makeNode(tree.x + hs/2, tree.y - hs/2, hs), // NE
+                makeNode(tree.x - hs/2, tree.y + hs/2, hs), // SW
+                makeNode(tree.x + hs/2, tree.y + hs/2, hs), // SE
+            ];
+        }
+
+        function insertToChild(tree, node) {
+            const idx = (node.x > tree.x ? 1 : 0) + (node.y > tree.y ? 2 : 0);
+            insert(tree.children[idx], node);
+        }
+
+        const root = makeNode(cx, cy, size);
+        for (const n of nodes) insert(root, n);
+        return root;
+    }
+
+    function quadTreeForce(tree, node, theta, k) {
+        if (!tree || tree.mass === 0) return {fx: 0, fy: 0};
+        if (tree.body && tree.body !== node) {
+            const dx = node.x - tree.comX;
+            const dy = node.y - tree.comY;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+            if (dist > k * 8) return {fx: 0, fy: 0};
+            const force = (k * k) / dist;
+            return {fx: (dx / dist) * force, fy: (dy / dist) * force};
+        }
+        if (!tree.children) return {fx: 0, fy: 0};
+        const dx = node.x - tree.comX;
+        const dy = node.y - tree.comY;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+        if (tree.size / dist < theta) {
+            // Treat as single body
+            if (dist > k * 8) return {fx: 0, fy: 0};
+            const force = (k * k * tree.mass) / dist;
+            return {fx: (dx / dist) * force, fy: (dy / dist) * force};
+        }
+        let fx = 0, fy = 0;
+        for (const child of tree.children) {
+            const f = quadTreeForce(child, node, theta, k);
+            fx += f.fx; fy += f.fy;
+        }
+        return {fx, fy};
+    }
+
+    G.runSimulation = function() {
+        const nodes = G.nodes;
+        const edges = G.edges;
         let iterations = 0;
-        const maxIter = 300;
+        const maxIter = 400;
+        const k = 180; // ideal spring length (was 60 — too dense)
 
         function tick() {
-            if (iterations > maxIter) { draw(); return; }
+            if (iterations > maxIter) {
+                G.drawGraph();
+                setTimeout(() => graphFitAll(), 50);
+                return;
+            }
             iterations++;
+            const cooling = 1 - (iterations / maxIter);
 
-            const W = canvas.clientWidth;
-            const H = canvas.clientHeight;
-            const k = Math.sqrt((W * H) / Math.max(nodes.length, 1));
-            const cooling = 1 - iterations / maxIter;
-
-            // Repulsion
-            for (let i = 0; i < nodes.length; i++) {
-                for (let j = i + 1; j < nodes.length; j++) {
-                    let dx = nodes[j].x - nodes[i].x;
-                    let dy = nodes[j].y - nodes[i].y;
-                    let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                    let force = (k * k) / dist * 0.5;
-                    let fx = (dx / dist) * force;
-                    let fy = (dy / dist) * force;
-                    nodes[i].vx -= fx;
-                    nodes[i].vy -= fy;
-                    nodes[j].vx += fx;
-                    nodes[j].vy += fy;
-                }
+            // Barnes-Hut repulsion O(n log n)
+            const tree = buildQuadTree(nodes);
+            for (const n of nodes) {
+                const f = quadTreeForce(tree, n, 0.7, k);
+                // Same-project nodes get less repulsion (applied in clustered sim only)
+                n.vx += f.fx * 2.0;
+                n.vy += f.fy * 2.0;
             }
 
             // Attraction along edges
             for (const e of edges) {
                 let dx = e.target.x - e.source.x;
                 let dy = e.target.y - e.source.y;
-                let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                let force = (dist * dist) / k * 0.02;
+                let dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+                let force = (dist - k * 1.2) * 0.02;
                 let fx = (dx / dist) * force;
                 let fy = (dy / dist) * force;
                 e.source.vx += fx;
@@ -1651,132 +2544,459 @@ function initGraph() {
                 e.target.vy -= fy;
             }
 
-            // Center gravity
+            // Weak center gravity
             for (const n of nodes) {
-                let dx = W / 2 - n.x;
-                let dy = H / 2 - n.y;
-                n.vx += dx * 0.001;
-                n.vy += dy * 0.001;
+                n.vx -= n.x * 0.0003;
+                n.vy -= n.y * 0.0003;
+            }
+
+            // Apply velocity with cooling
+            for (const n of nodes) {
+                if (n === G.dragNode) continue;
+                let speed = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
+                let maxSpeed = 20 * cooling;
+                if (speed > maxSpeed && speed > 0) {
+                    n.vx = (n.vx / speed) * maxSpeed;
+                    n.vy = (n.vy / speed) * maxSpeed;
+                }
+                n.x += n.vx * cooling;
+                n.y += n.vy * cooling;
+                n.vx *= 0.82;
+                n.vy *= 0.82;
+            }
+
+            if (iterations % 4 === 0) G.drawGraph();
+            requestAnimationFrame(tick);
+        }
+        tick();
+    };
+
+    // Clustered simulation: keeps nodes near their cluster center
+    G.runClusteredSimulation = function(groups, colorMap) {
+        const nodes = G.nodes;
+        const edges = G.edges;
+        let iterations = 0;
+        const maxIter = 250;
+
+        // Compute cluster centers
+        const centers = {};
+        for (const key of Object.keys(groups)) {
+            const ns = groups[key];
+            let sx = 0, sy = 0;
+            for (const n of ns) { sx += n.x; sy += n.y; }
+            centers[key] = {x: sx / ns.length, y: sy / ns.length};
+        }
+
+        function tick() {
+            if (iterations > maxIter) {
+                G.drawGraph();
+                setTimeout(() => graphFitAll(), 50);
+                return;
+            }
+            iterations++;
+            const cooling = 1 - (iterations / maxIter);
+            const k = 30;
+
+            // Intra-cluster repulsion (only between nodes in same cluster)
+            for (const key of Object.keys(groups)) {
+                const ns = groups[key];
+                if (ns.length > 500) {
+                    // Use quad-tree for large clusters
+                    const tree = buildQuadTree(ns);
+                    for (const n of ns) {
+                        const f = quadTreeForce(tree, n, 0.7, k);
+                        n.vx += f.fx * 0.5;
+                        n.vy += f.fy * 0.5;
+                    }
+                } else {
+                    for (let i = 0; i < ns.length; i++) {
+                        for (let j = i + 1; j < ns.length; j++) {
+                            let dx = ns[j].x - ns[i].x;
+                            let dy = ns[j].y - ns[i].y;
+                            let dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+                            if (dist > k * 5) continue;
+                            let force = (k * k) / dist * 0.4;
+                            let fx = (dx / dist) * force;
+                            let fy = (dy / dist) * force;
+                            ns[i].vx -= fx; ns[i].vy -= fy;
+                            ns[j].vx += fx; ns[j].vy += fy;
+                        }
+                    }
+                }
+            }
+
+            // Attraction to cluster center (strong)
+            for (const key of Object.keys(groups)) {
+                const c = centers[key];
+                for (const n of groups[key]) {
+                    const dx = c.x - n.x;
+                    const dy = c.y - n.y;
+                    n.vx += dx * 0.008;
+                    n.vy += dy * 0.008;
+                }
+            }
+
+            // Intra-cluster edge attraction
+            for (const e of edges) {
+                if (e.source.clusterKey !== e.target.clusterKey) continue;
+                let dx = e.target.x - e.source.x;
+                let dy = e.target.y - e.source.y;
+                let dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+                let force = (dist - k * 0.6) * 0.03;
+                let fx = (dx / dist) * force;
+                let fy = (dy / dist) * force;
+                e.source.vx += fx; e.source.vy += fy;
+                e.target.vx -= fx; e.target.vy -= fy;
             }
 
             // Apply velocity
             for (const n of nodes) {
-                if (n === dragNode) continue;
+                if (n === G.dragNode) continue;
                 let speed = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
                 let maxSpeed = 10 * cooling;
                 if (speed > maxSpeed && speed > 0) {
                     n.vx = (n.vx / speed) * maxSpeed;
                     n.vy = (n.vy / speed) * maxSpeed;
                 }
-                n.x += n.vx;
-                n.y += n.vy;
-                n.vx *= 0.9;
-                n.vy *= 0.9;
-
-                // Bounds
-                n.x = Math.max(n.radius, Math.min(W - n.radius, n.x));
-                n.y = Math.max(n.radius, Math.min(H - n.radius, n.y));
+                n.x += n.vx * cooling;
+                n.y += n.vy * cooling;
+                n.vx *= 0.8;
+                n.vy *= 0.8;
             }
 
-            draw();
+            if (iterations % 4 === 0) G.drawGraph();
             requestAnimationFrame(tick);
         }
         tick();
-    }
+    };
 
-    function draw() {
+    G.drawGraph = function() {
         const W = canvas.clientWidth;
         const H = canvas.clientHeight;
         ctx.clearRect(0, 0, W, H);
 
-        // Edges
-        ctx.lineWidth = 0.5;
-        ctx.strokeStyle = 'rgba(100,116,139,0.3)';
-        for (const e of edges) {
-            ctx.beginPath();
-            ctx.moveTo(e.source.x, e.source.y);
-            ctx.lineTo(e.target.x, e.target.y);
-            ctx.stroke();
+        const visNodes = G.visibleNodes();
+        const visNodeIds = new Set(visNodes.map(n => n.id));
+        let visEdges = G.showEdges ? G.edges.filter(e => visNodeIds.has(e.source.id) && visNodeIds.has(e.target.id)) : [];
+        // Limit edges to prevent visual clutter (keep strongest connections)
+        const MAX_VIS_EDGES = 1500;
+        if (visEdges.length > MAX_VIS_EDGES) {
+            visEdges.sort((a, b) => (b.weight || 1) - (a.weight || 1));
+            visEdges = visEdges.slice(0, MAX_VIS_EDGES);
         }
 
-        // Nodes
-        for (const n of nodes) {
-            ctx.beginPath();
-            ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-            ctx.fillStyle = n === hoveredNode
-                ? n.color
-                : n.color + '99';
-            ctx.fill();
+        // Highlight matched search nodes
+        const searchSet = new Set();
+        if (G.searchQuery) {
+            for (const n of visNodes) searchSet.add(n.id);
+        }
 
-            if (n === hoveredNode) {
-                ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 2;
+        // Draw cluster hulls
+        if (G.showHulls && G.clusterMode !== 'none' && G.clusterGroups) {
+            for (const key of Object.keys(G.clusterGroups)) {
+                const clNodes = G.clusterGroups[key].filter(n => visNodeIds.has(n.id));
+                if (clNodes.length < 3) continue;
+                const points = clNodes.map(n => {
+                    const s = toScreen(n.x, n.y);
+                    return {x: s.x, y: s.y};
+                });
+                const hull = convexHull(points);
+                if (hull.length < 3) continue;
+
+                const color = G.clusterColorMap[key] || '#64748b';
+                // Draw expanded hull with padding
+                ctx.beginPath();
+                // Smooth hull with rounded corners
+                const pad = 20 * G.zoom;
+                for (let i = 0; i < hull.length; i++) {
+                    const p = hull[i];
+                    // Offset points outward from centroid
+                    let cx2 = 0, cy2 = 0;
+                    for (const h of hull) { cx2 += h.x; cy2 += h.y; }
+                    cx2 /= hull.length; cy2 /= hull.length;
+                    const dx = p.x - cx2;
+                    const dy = p.y - cy2;
+                    const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+                    const ox = p.x + (dx / dist) * pad;
+                    const oy = p.y + (dy / dist) * pad;
+                    if (i === 0) ctx.moveTo(ox, oy);
+                    else ctx.lineTo(ox, oy);
+                }
+                ctx.closePath();
+                ctx.fillStyle = color + '12';
+                ctx.fill();
+                ctx.strokeStyle = color + '30';
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([4, 4]);
                 ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Cluster label at centroid
+                let lcx = 0, lcy = 0;
+                for (const n of clNodes) { const s = toScreen(n.x, n.y); lcx += s.x; lcy += s.y; }
+                lcx /= clNodes.length; lcy /= clNodes.length;
+                const fontSize = Math.max(11, Math.min(16, 13 * G.zoom));
+                ctx.font = 'bold ' + fontSize + 'px system-ui';
+                ctx.textAlign = 'center';
+                ctx.fillStyle = color + 'aa';
+                ctx.fillText(key + ' (' + clNodes.length + ')', lcx, lcy - (Math.sqrt(clNodes.length) * 3 * G.zoom));
             }
         }
-    }
 
-    // Mouse interaction
+        // Draw edges (batch by style for performance)
+        if (visEdges.length > 0) {
+            // Non-hovered edges
+            ctx.beginPath();
+            ctx.strokeStyle = 'rgba(100,116,139,0.06)';
+            ctx.lineWidth = Math.max(0.2, 0.4 * G.zoom);
+            for (const e of visEdges) {
+                if (G.hoveredNode && (e.source.id === G.hoveredNode.id || e.target.id === G.hoveredNode.id)) continue;
+                const s = toScreen(e.source.x, e.source.y);
+                const t = toScreen(e.target.x, e.target.y);
+                // Cull off-screen edges
+                if ((s.x < 0 && t.x < 0) || (s.x > W && t.x > W)) continue;
+                if ((s.y < 0 && t.y < 0) || (s.y > H && t.y > H)) continue;
+                ctx.moveTo(s.x, s.y);
+                ctx.lineTo(t.x, t.y);
+            }
+            ctx.stroke();
+
+            // Hovered node edges
+            if (G.hoveredNode) {
+                ctx.beginPath();
+                ctx.strokeStyle = 'rgba(96,165,250,0.8)';
+                ctx.lineWidth = 2 * G.zoom;
+                for (const e of visEdges) {
+                    if (e.source.id !== G.hoveredNode.id && e.target.id !== G.hoveredNode.id) continue;
+                    const s = toScreen(e.source.x, e.source.y);
+                    const t = toScreen(e.target.x, e.target.y);
+                    ctx.moveTo(s.x, s.y);
+                    ctx.lineTo(t.x, t.y);
+                }
+                ctx.stroke();
+
+                // Edge labels when zoomed
+                if (G.showLabels && G.zoom > 1.5) {
+                    for (const e of visEdges) {
+                        if (e.source.id !== G.hoveredNode.id && e.target.id !== G.hoveredNode.id) continue;
+                        const s = toScreen(e.source.x, e.source.y);
+                        const t = toScreen(e.target.x, e.target.y);
+                        const mx = (s.x + t.x) / 2;
+                        const my = (s.y + t.y) / 2;
+                        ctx.font = Math.max(9, 10 * G.zoom) + 'px system-ui';
+                        ctx.fillStyle = 'rgba(148,163,184,0.8)';
+                        ctx.textAlign = 'center';
+                        ctx.fillText(e.type, mx, my - 3);
+                    }
+                }
+            }
+        }
+
+        // Build hovered adjacency set for dimming
+        let hoveredAdj = null;
+        if (G.hoveredNode) {
+            hoveredAdj = new Set();
+            hoveredAdj.add(G.hoveredNode.id);
+            for (const e of G.edges) {
+                if (e.source.id === G.hoveredNode.id) hoveredAdj.add(e.target.id);
+                if (e.target.id === G.hoveredNode.id) hoveredAdj.add(e.source.id);
+            }
+        }
+
+        // Draw nodes
+        for (const n of visNodes) {
+            const s = toScreen(n.x, n.y);
+            const r = n.radius * G.zoom;
+            if (s.x + r < -5 || s.x - r > W + 5 || s.y + r < -5 || s.y - r > H + 5) continue;
+
+            const dimmed = hoveredAdj && !hoveredAdj.has(n.id);
+            const isSearchMatch = G.searchQuery && searchSet.has(n.id);
+            const nodeColor = (G.clusterMode !== 'none' && n.clusterColor) ? n.clusterColor : n.color;
+
+            // Node glow for hovered or search match
+            if (n === G.hoveredNode || isSearchMatch) {
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, r + 5, 0, Math.PI * 2);
+                ctx.fillStyle = (isSearchMatch ? '#fbbf24' : nodeColor) + '44';
+                ctx.fill();
+            }
+
+            // Node circle
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+            if (dimmed) {
+                ctx.fillStyle = nodeColor + '25';
+            } else if (n === G.hoveredNode) {
+                ctx.fillStyle = nodeColor;
+            } else {
+                ctx.fillStyle = nodeColor + 'bb';
+            }
+            ctx.fill();
+
+            // Border: cluster color or project color
+            if (n === G.hoveredNode) {
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2.5;
+            } else if (isSearchMatch) {
+                ctx.strokeStyle = '#fbbf24';
+                ctx.lineWidth = 2;
+            } else {
+                ctx.strokeStyle = (G.clusterMode !== 'none' && n.clusterColor) ? n.clusterColor + '55' : n.projectColor + '55';
+                ctx.lineWidth = 0.8;
+            }
+            ctx.stroke();
+
+            // Labels
+            if (G.showLabels && G.zoom > 0.6 && !dimmed) {
+                const fontSize = Math.max(8, Math.min(12, 10 * G.zoom));
+                ctx.font = fontSize + 'px system-ui';
+                ctx.textAlign = 'center';
+
+                if (G.zoom > 1.2 || n === G.hoveredNode) {
+                    const lbl = n.label.length > 40 ? n.label.slice(0, 37) + '...' : n.label;
+                    ctx.fillStyle = 'rgba(226,232,240,0.9)';
+                    ctx.fillText(lbl, s.x, s.y + r + fontSize + 2);
+                } else if (G.zoom > 0.6) {
+                    ctx.fillStyle = 'rgba(148,163,184,0.5)';
+                    ctx.fillText(n.project, s.x, s.y + r + fontSize + 2);
+                }
+            }
+        }
+
+        // Legend (bottom-left) — only when not clustered (cluster legend is in HTML)
+        if (G.clusterMode === 'none') {
+            const ltypes = [...new Set(visNodes.map(n => n.type))];
+            ctx.font = '11px system-ui';
+            ctx.textAlign = 'left';
+            ltypes.forEach((t, i) => {
+                const ly = H - 16 - (ltypes.length - 1 - i) * 18;
+                ctx.beginPath();
+                ctx.arc(16, ly, 5, 0, Math.PI * 2);
+                ctx.fillStyle = typeColors[t] || '#64748b';
+                ctx.fill();
+                ctx.fillStyle = 'rgba(148,163,184,0.7)';
+                ctx.fillText(t, 28, ly + 4);
+            });
+        }
+    };
+
+    // ---- Mouse interaction with zoom/pan ----
+    canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        const br = canvas.getBoundingClientRect();
+        const mx = e.clientX - br.left;
+        const my = e.clientY - br.top;
+        const factor = e.deltaY < 0 ? 1.15 : 0.87;
+        G.panX = mx - (mx - G.panX) * factor;
+        G.panY = my - (my - G.panY) * factor;
+        G.zoom *= factor;
+        G.zoom = Math.max(0.05, Math.min(15, G.zoom));
+        G.drawGraph();
+    }, {passive: false});
+
     canvas.addEventListener('mousemove', e => {
         const br = canvas.getBoundingClientRect();
         const mx = e.clientX - br.left;
         const my = e.clientY - br.top;
 
-        if (dragNode) {
-            dragNode.x = mx;
-            dragNode.y = my;
-            dragNode.vx = 0;
-            dragNode.vy = 0;
-            draw();
+        // Drag node
+        if (G.dragNode) {
+            const w = toWorld(mx, my);
+            G.dragNode.x = w.x;
+            G.dragNode.y = w.y;
+            G.dragNode.vx = 0;
+            G.dragNode.vy = 0;
+            G.drawGraph();
             return;
         }
 
+        // Pan
+        if (G.isPanning) {
+            G.panX += mx - G.lastMouse.x;
+            G.panY += my - G.lastMouse.y;
+            G.lastMouse = {x: mx, y: my};
+            G.drawGraph();
+            return;
+        }
+
+        // Hover detection in world coords
+        const w = toWorld(mx, my);
         let found = null;
-        for (const n of nodes) {
-            const dx = n.x - mx;
-            const dy = n.y - my;
-            if (dx * dx + dy * dy < (n.radius + 4) * (n.radius + 4)) {
+        const visNodes = G.visibleNodes();
+        for (const n of visNodes) {
+            const dx = n.x - w.x;
+            const dy = n.y - w.y;
+            const hitR = n.radius + 4 / G.zoom;
+            if (dx * dx + dy * dy < hitR * hitR) {
                 found = n;
                 break;
             }
         }
 
-        if (found !== hoveredNode) {
-            hoveredNode = found;
-            draw();
+        if (found !== G.hoveredNode) {
+            G.hoveredNode = found;
+            G.drawGraph();
         }
 
-        if (hoveredNode) {
+        if (G.hoveredNode) {
+            canvas.style.cursor = 'pointer';
             tooltip.style.display = 'block';
-            tooltip.style.left = (e.clientX + 12) + 'px';
-            tooltip.style.top = (e.clientY + 12) + 'px';
-            const ttType = tooltip.querySelector('.tt-type');
-            const ttContent = tooltip.querySelector('.tt-content');
-            ttType.textContent = hoveredNode.type;
-            ttType.style.color = hoveredNode.color;
-            ttContent.textContent = hoveredNode.label;
+            tooltip.style.left = (e.clientX + 14) + 'px';
+            tooltip.style.top = (e.clientY + 14) + 'px';
+            tooltip.querySelector('.tt-type').textContent = G.hoveredNode.type;
+            tooltip.querySelector('.tt-type').style.color = G.hoveredNode.color;
+            tooltip.querySelector('.tt-project').textContent = G.hoveredNode.project;
+            tooltip.querySelector('.tt-content').textContent = G.hoveredNode.label;
+            const ne = getNodeEdges(G.hoveredNode);
+            tooltip.querySelector('.tt-edges').textContent = ne.length ?
+                ne.length + ' connection(s): ' + [...new Set(ne.map(x=>x.type))].join(', ') : 'No connections';
         } else {
+            canvas.style.cursor = 'grab';
             tooltip.style.display = 'none';
         }
     });
 
     canvas.addEventListener('mousedown', e => {
-        if (hoveredNode) {
-            dragNode = hoveredNode;
+        const br = canvas.getBoundingClientRect();
+        const mx = e.clientX - br.left;
+        const my = e.clientY - br.top;
+
+        if (G.hoveredNode) {
+            G.dragNode = G.hoveredNode;
+            canvas.style.cursor = 'grabbing';
+        } else {
+            G.isPanning = true;
+            G.lastMouse = {x: mx, y: my};
             canvas.style.cursor = 'grabbing';
         }
     });
 
     canvas.addEventListener('mouseup', () => {
-        dragNode = null;
-        canvas.style.cursor = 'grab';
+        G.dragNode = null;
+        G.isPanning = false;
+        canvas.style.cursor = G.hoveredNode ? 'pointer' : 'grab';
     });
 
     canvas.addEventListener('mouseleave', () => {
         tooltip.style.display = 'none';
-        hoveredNode = null;
-        dragNode = null;
-        draw();
+        G.hoveredNode = null;
+        G.dragNode = null;
+        G.isPanning = false;
+        G.drawGraph();
+    });
+
+    // Double-click to zoom into node
+    canvas.addEventListener('dblclick', e => {
+        const br = canvas.getBoundingClientRect();
+        const mx = e.clientX - br.left;
+        const my = e.clientY - br.top;
+        if (G.hoveredNode) {
+            const targetZoom = 2.5;
+            G.zoom = targetZoom;
+            G.panX = mx - G.hoveredNode.x * targetZoom;
+            G.panY = my - G.hoveredNode.y * targetZoom;
+            G.drawGraph();
+        }
     });
 }
 
@@ -1795,6 +3015,11 @@ document.querySelectorAll('.tab').forEach(tab => {
         if (target === 'graph') initGraph();
         if (target === 'self-improvement') loadSelfImprovement();
         if (target === 'rules') loadRules();
+        if (target === 'v5-graph') loadV5Graph();
+        if (target === 'v5-episodes') loadV5Episodes();
+        if (target === 'v5-skills') loadV5Skills();
+        if (target === 'v5-self') { loadV5SelfModel(); if (!window._selfModelInterval) window._selfModelInterval = setInterval(loadV5SelfModel, 60000); }
+        if (target === 'v5-reflection') loadV5Reflection();
         if (target === 'live-feed') initLiveFeed();
     });
 });
@@ -1852,6 +3077,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal()
 loadStats();
 loadKnowledge();
 loadSIStats();
+loadV5Stats();
 
 // ============================================================
 // Live Feed (SSE)
@@ -1912,6 +3138,642 @@ function addFeedItem(type, data) {
     list.prepend(item);
     while (list.children.length > MAX_FEED_ITEMS) list.lastChild.remove();
 }
+
+// ============================================================
+// Super Memory v5 — Stats loading
+// ============================================================
+async function loadV5Stats() {
+    try {
+        const gs = await api('/api/graph-stats');
+        document.getElementById('stat-graph').textContent = gs.total_nodes;
+        document.getElementById('stat-graph-detail').textContent = gs.total_nodes + ' nodes, ' + gs.total_edges + ' edges';
+    } catch (_) {
+        document.getElementById('stat-graph').textContent = 'N/A';
+        document.getElementById('stat-graph-detail').textContent = 'tables not available';
+    }
+
+    try {
+        const ep = await api('/api/episodes');
+        const st = ep.stats || {};
+        document.getElementById('stat-episodes').textContent = st.total || 0;
+        const b = (st.by_outcome || {}).breakthrough || 0;
+        const f = (st.by_outcome || {}).failure || 0;
+        document.getElementById('stat-episodes-detail').textContent = b + ' breakthroughs, ' + f + ' failures';
+    } catch (_) {
+        document.getElementById('stat-episodes').textContent = 'N/A';
+        document.getElementById('stat-episodes-detail').textContent = 'tables not available';
+    }
+
+    try {
+        const sk = await api('/api/skills');
+        document.getElementById('stat-skills').textContent = sk.total || 0;
+        if (sk.skills && sk.skills.length > 0) {
+            const avgSr = sk.skills.reduce((a, s) => a + (s.success_rate || 0), 0) / sk.skills.length;
+            document.getElementById('stat-skills-detail').textContent = 'avg success: ' + (avgSr * 100).toFixed(0) + '%';
+        }
+    } catch (_) {
+        document.getElementById('stat-skills').textContent = 'N/A';
+        document.getElementById('stat-skills-detail').textContent = 'tables not available';
+    }
+
+    try {
+        const sm = await api('/api/self-model');
+        document.getElementById('stat-blind-spots').textContent = (sm.blind_spots || []).length;
+    } catch (_) {
+        document.getElementById('stat-blind-spots').textContent = 'N/A';
+    }
+}
+
+// ============================================================
+// Super Memory v5 — Graph Tab
+// ============================================================
+async function loadV5Graph() {
+    try {
+        const data = await api('/api/graph-stats');
+
+        // Nodes by type
+        const nodesDiv = document.getElementById('v5-nodes-by-type');
+        nodesDiv.innerHTML = Object.entries(data.nodes_by_type || {}).map(([type, count]) =>
+            '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">' +
+            '<span class="badge badge-' + type + '">' + escapeHtml(type) + '</span>' +
+            '<span style="font-weight:600;color:var(--accent)">' + count + '</span></div>'
+        ).join('') || '<div style="color:var(--text-dim)">No graph nodes yet</div>';
+
+        // Edges by type
+        const edgesDiv = document.getElementById('v5-edges-by-type');
+        edgesDiv.innerHTML = Object.entries(data.edges_by_type || {}).map(([type, count]) =>
+            '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">' +
+            '<span style="color:var(--text)">' + escapeHtml(type) + '</span>' +
+            '<span style="font-weight:600;color:var(--decision)">' + count + '</span></div>'
+        ).join('') || '<div style="color:var(--text-dim)">No graph edges yet</div>';
+
+        // Top nodes table
+        const tbody = document.getElementById('v5-top-nodes-body');
+        tbody.innerHTML = (data.top_nodes || []).map(n =>
+            '<tr>' +
+            '<td>' + escapeHtml(n.name) + '</td>' +
+            '<td><span class="badge badge-' + (n.type || 'fact') + '">' + escapeHtml(n.type) + '</span></td>' +
+            '<td style="font-weight:600;color:var(--accent)">' + (n.importance || 0).toFixed(1) + '</td>' +
+            '<td>' + (n.mention_count || 0) + '</td>' +
+            '</tr>'
+        ).join('') || '<tr><td colspan="4" style="color:var(--text-dim)">No graph nodes yet</td></tr>';
+    } catch (e) {
+        document.getElementById('v5-top-nodes-body').innerHTML =
+            '<tr><td colspan="4" style="color:var(--text-dim)">Graph tables not available: ' + escapeHtml(e.message) + '</td></tr>';
+    }
+}
+
+// ============================================================
+// Super Memory v5 — Episodes Tab
+// ============================================================
+const outcomeColors = { breakthrough: 'var(--solution)', failure: 'var(--lesson)', routine: 'var(--text-dim)', discovery: 'var(--accent)', success: 'var(--solution)' };
+
+async function loadV5Episodes() {
+    try {
+        const data = await api('/api/episodes');
+        const stats = data.stats || {};
+
+        // Stats badges
+        const statsDiv = document.getElementById('v5-episode-stats');
+        const badges = [
+            { label: 'Total', value: stats.total || 0, color: 'var(--text)' },
+            { label: 'Avg Impact', value: (stats.avg_impact || 0).toFixed(1), color: 'var(--accent)' },
+        ];
+        Object.entries(stats.by_outcome || {}).forEach(([k, v]) => {
+            badges.push({ label: k, value: v, color: outcomeColors[k] || 'var(--text-dim)' });
+        });
+        statsDiv.innerHTML = badges.map(b =>
+            '<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 20px;text-align:center">' +
+            '<div style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.05em">' + escapeHtml(b.label) + '</div>' +
+            '<div style="font-size:24px;font-weight:700;color:' + b.color + '">' + b.value + '</div></div>'
+        ).join('');
+
+        // Episodes timeline
+        const listDiv = document.getElementById('v5-episodes-list');
+        listDiv.innerHTML = (data.episodes || []).map(ep => {
+            const oc = ep.outcome || 'routine';
+            const color = outcomeColors[oc] || 'var(--text-dim)';
+            return '<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;border-left:4px solid ' + color + '">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+                '<span style="color:' + color + ';font-weight:600;text-transform:uppercase;font-size:12px;padding:2px 8px;border:1px solid ' + color + ';border-radius:4px">' + escapeHtml(oc) + '</span>' +
+                '<span style="color:var(--text-dim);font-size:12px">' + formatDate(ep.created_at) + '</span></div>' +
+                '<div style="color:var(--text);font-size:14px;margin-bottom:6px">' + escapeHtml(truncate(ep.summary || ep.description || '', 200)) + '</div>' +
+                '<div style="display:flex;gap:12px;color:var(--text-dim);font-size:12px">' +
+                (ep.impact_score != null ? '<span>Impact: <strong style="color:var(--accent)">' + ep.impact_score + '</strong></span>' : '') +
+                (ep.project ? '<span>Project: ' + escapeHtml(ep.project) + '</span>' : '') +
+                '</div></div>';
+        }).join('') || '<div style="color:var(--text-dim);padding:20px;text-align:center">No episodes recorded yet</div>';
+    } catch (e) {
+        document.getElementById('v5-episodes-list').innerHTML =
+            '<div style="color:var(--text-dim);padding:20px">Episodes table not available: ' + escapeHtml(e.message) + '</div>';
+    }
+}
+
+// ============================================================
+// Super Memory v5 — Skills Tab
+// ============================================================
+let _allSkills = [];
+
+function renderSkillCard(sk) {
+    const sr = (sk.success_rate || 0);
+    const srPct = (sr * 100).toFixed(0);
+    const barColor = sr >= 0.8 ? 'var(--solution)' : sr >= 0.5 ? 'var(--decision)' : 'var(--lesson)';
+
+    let stepsHtml = '';
+    if (sk.steps) {
+        try {
+            const steps = typeof sk.steps === 'string' ? JSON.parse(sk.steps) : sk.steps;
+            if (Array.isArray(steps) && steps.length > 0 && steps[0] !== 'See full definition for details') {
+                stepsHtml = '<details style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">' +
+                    '<summary style="color:var(--text-dim);font-size:11px;text-transform:uppercase;cursor:pointer">Steps (' + steps.length + ')</summary>' +
+                    '<div style="margin-top:4px">' +
+                    steps.map((s, i) => '<div style="color:var(--text);font-size:13px;padding:2px 0">' + (i+1) + '. ' + escapeHtml(s) + '</div>').join('') +
+                    '</div></details>';
+            }
+        } catch (_) {}
+    }
+
+    let antiHtml = '';
+    if (sk.anti_patterns) {
+        try {
+            const anti = typeof sk.anti_patterns === 'string' ? JSON.parse(sk.anti_patterns) : sk.anti_patterns;
+            if (Array.isArray(anti) && anti.length > 0) {
+                antiHtml = '<details style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">' +
+                    '<summary style="color:var(--lesson);font-size:11px;text-transform:uppercase;cursor:pointer">Anti-patterns (' + anti.length + ')</summary>' +
+                    '<div style="margin-top:4px">' +
+                    anti.map(a => '<div style="color:var(--text-dim);font-size:13px;padding:2px 0">\u2718 ' + escapeHtml(a) + '</div>').join('') +
+                    '</div></details>';
+            }
+        } catch (_) {}
+    }
+
+    const src = sk.source || '';
+    const badgeColor = src === 'claude-commands' ? 'var(--solution)' : src === 'claude-agents' ? 'var(--convention)' : src === 'claude-rules' ? 'var(--decision)' : 'var(--text-dim)';
+    const badgeLabel = src === 'claude-commands' ? 'Command' : src === 'claude-agents' ? 'Agent' : src === 'claude-rules' ? 'Rules' : 'Skill';
+
+    let stackHtml = '';
+    const stackList = sk.stack_list || (sk.stack ? (() => { try { return JSON.parse(sk.stack); } catch(_) { return []; } })() : []);
+    if (stackList.length > 0) {
+        stackHtml = '<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:4px">' +
+            stackList.map(t => '<span style="background:var(--border);color:var(--text-dim);font-size:11px;padding:2px 8px;border-radius:10px">' + escapeHtml(t) + '</span>').join('') +
+            '</div>';
+    }
+
+    return '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+        '<div style="display:flex;align-items:center;gap:8px">' +
+        '<span style="background:' + badgeColor + ';color:#000;font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;text-transform:uppercase">' + badgeLabel + '</span>' +
+        '<h4 style="color:var(--text);font-size:15px;margin:0">' + escapeHtml((sk.name || '').replace(/^(cmd:|agent:|rules:)/, '')) + '</h4></div>' +
+        '<span style="color:var(--text-dim);font-size:12px">' + (sk.times_used ? 'Used ' + sk.times_used + 'x' : sk.status || '') + '</span></div>' +
+        (sk.description ? '<div style="color:var(--text-dim);font-size:13px;margin-bottom:6px">' + escapeHtml(truncate(sk.description, 200)) + '</div>' : '') +
+        (sk.trigger_pattern ? '<div style="color:var(--text-dim);font-size:12px;font-family:monospace;margin-bottom:10px;opacity:0.7">' + escapeHtml(sk.trigger_pattern) + '</div>' : '') +
+        (sk.times_used > 0 ? '<div style="margin-bottom:4px;display:flex;justify-content:space-between;font-size:12px">' +
+            '<span style="color:var(--text-dim)">Success Rate</span><span style="color:' + barColor + ';font-weight:600">' + srPct + '%</span></div>' +
+            '<div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">' +
+            '<div style="height:100%;width:' + srPct + '%;background:' + barColor + ';border-radius:3px;transition:width 0.5s"></div></div>' : '') +
+        stackHtml + stepsHtml + antiHtml + '</div>';
+}
+
+function filterAndRenderSkills() {
+    const search = (document.getElementById('v5-skills-search').value || '').toLowerCase();
+    const typeFilter = document.getElementById('v5-skills-filter').value;
+    const listDiv = document.getElementById('v5-skills-list');
+
+    let filtered = _allSkills;
+    if (typeFilter) filtered = filtered.filter(sk => (sk.name || '').startsWith(typeFilter));
+    if (search) filtered = filtered.filter(sk =>
+        (sk.name || '').toLowerCase().includes(search) ||
+        (sk.description || '').toLowerCase().includes(search) ||
+        (sk.trigger_pattern || '').toLowerCase().includes(search)
+    );
+
+    document.getElementById('v5-skills-count').textContent = filtered.length + ' of ' + _allSkills.length;
+    listDiv.innerHTML = filtered.map(renderSkillCard).join('') ||
+        '<div style="color:var(--text-dim);padding:20px;text-align:center">No skills match filter</div>';
+}
+
+async function loadV5Skills() {
+    try {
+        const data = await api('/api/skills');
+        _allSkills = data.skills || [];
+        filterAndRenderSkills();
+
+        // Attach filter listeners once
+        const searchEl = document.getElementById('v5-skills-search');
+        const filterEl = document.getElementById('v5-skills-filter');
+        if (!searchEl._bound) {
+            searchEl.addEventListener('input', filterAndRenderSkills);
+            filterEl.addEventListener('change', filterAndRenderSkills);
+            searchEl._bound = true;
+        }
+    } catch (e) {
+        document.getElementById('v5-skills-list').innerHTML =
+            '<div style="color:var(--text-dim);padding:20px">Skills table not available: ' + escapeHtml(e.message) + '</div>';
+    }
+}
+
+// ============================================================
+// Super Memory v5 — Self Model Tab
+// ============================================================
+async function loadV5SelfModel() {
+    try {
+        const data = await api('/api/self-model');
+
+        // Competencies as horizontal bars
+        const compDiv = document.getElementById('v5-competencies');
+        compDiv.innerHTML = (data.competencies || []).map(c => {
+            const level = c.level || 0;
+            const pct = Math.min(100, level * 100).toFixed(0);
+            const color = level >= 0.85 ? 'var(--solution)' : level >= 0.7 ? 'var(--accent)' : level >= 0.5 ? 'var(--decision)' : 'var(--lesson)';
+            const trend = c.trend === 'improving' ? ' ↑' : c.trend === 'stable_low' ? ' ⚠' : '';
+            return '<div style="margin-bottom:12px">' +
+                '<div style="display:flex;justify-content:space-between;margin-bottom:4px">' +
+                '<span style="color:var(--text);font-size:14px">' + escapeHtml(c.domain || c.name || 'Unknown') + '</span>' +
+                '<span style="color:' + color + ';font-weight:600;font-size:14px">' + pct + '%' + trend + '</span></div>' +
+                '<div style="height:8px;background:var(--border);border-radius:4px;overflow:hidden">' +
+                '<div style="height:100%;width:' + pct + '%;background:' + color + ';border-radius:4px;transition:width 0.5s"></div></div>' +
+                (c.based_on ? '<div style="color:var(--text-dim);font-size:11px;margin-top:2px">' + c.based_on + ' evidence · ' + (c.trend || '') + '</div>' : '') +
+                '</div>';
+        }).join('') || '<div style="color:var(--text-dim)">No competency data yet</div>';
+
+        // Blind spots
+        const bsDiv = document.getElementById('v5-blind-spots');
+        bsDiv.innerHTML = (data.blind_spots || []).map(bs => {
+            const isMonitoring = bs.status === 'monitoring';
+            const borderColor = isMonitoring ? 'var(--accent)' : 'var(--lesson)';
+            const statusLabel = isMonitoring ? '📚 Learning' : '⚠️ Unknown area';
+            const statusColor = isMonitoring ? 'var(--accent)' : 'var(--lesson)';
+            return '<div style="background:var(--card);border:1px solid var(--border);border-left:3px solid ' + borderColor + ';border-radius:8px;padding:12px;margin-bottom:8px">' +
+            '<div style="color:' + statusColor + ';font-weight:600;font-size:13px;margin-bottom:4px">' + statusLabel + '</div>' +
+            '<div style="color:var(--text);font-size:13px">' + escapeHtml(bs.description || '') + '</div>' +
+            '</div>';
+        }).join('') || '<div style="color:var(--text-dim)">No blind spots detected</div>';
+
+        // User model
+        const umDiv = document.getElementById('v5-user-model');
+        const entries = Object.entries(data.user_model || {});
+        umDiv.innerHTML = entries.map(([key, val]) =>
+            '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">' +
+            '<span style="color:var(--text);font-size:13px">' + escapeHtml(key) + '</span>' +
+            '<div style="display:flex;align-items:center;gap:8px">' +
+            '<span style="color:var(--accent);font-size:13px">' + escapeHtml(String(val.value || '')) + '</span>' +
+            '<span style="color:var(--text-dim);font-size:11px">(' + ((val.confidence || 0) * 100).toFixed(0) + '%)</span></div></div>'
+        ).join('') || '<div style="color:var(--text-dim)">No user model data yet</div>';
+    } catch (e) {
+        document.getElementById('v5-competencies').innerHTML =
+            '<div style="color:var(--text-dim)">Self model tables not available: ' + escapeHtml(e.message) + '</div>';
+    }
+}
+
+// ============================================================
+// Super Memory v5 — Reflection Tab
+// ============================================================
+async function loadV5Reflection() {
+    try {
+        const data = await api('/api/reflection');
+
+        // Reports
+        const reportsDiv = document.getElementById('v5-reports');
+        reportsDiv.innerHTML = (data.reports || []).map(r =>
+            '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px">' +
+            '<div style="display:flex;justify-content:space-between;margin-bottom:8px">' +
+            '<span style="color:var(--rule-color);font-weight:600;font-size:14px">' + escapeHtml(r.title || r.type || 'Report') + '</span>' +
+            '<span style="color:var(--text-dim);font-size:12px">' + formatDate(r.created_at) + '</span></div>' +
+            '<div style="color:var(--text);font-size:14px;white-space:pre-wrap">' + escapeHtml(truncate(r.content || r.summary || '', 500)) + '</div>' +
+            (r.recommendations ? '<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:var(--text-dim);font-size:13px">' +
+            '<strong>Recommendations:</strong> ' + escapeHtml(truncate(r.recommendations, 200)) + '</div>' : '') +
+            '</div>'
+        ).join('') || '<div style="color:var(--text-dim);padding:20px;text-align:center">No reflection reports yet</div>';
+
+        // Proposals
+        const proposalsDiv = document.getElementById('v5-proposals');
+        proposalsDiv.innerHTML = (data.proposals || []).map(p =>
+            '<div style="background:var(--card);border:1px solid var(--border);border-left:3px solid var(--decision);border-radius:8px;padding:16px">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+            '<span style="color:var(--decision);font-weight:600;font-size:13px">' + escapeHtml(p.type || 'Proposal') + '</span>' +
+            '<span style="color:var(--text-dim);font-size:12px">' + formatDate(p.created_at) + '</span></div>' +
+            '<div style="color:var(--text);font-size:14px;margin-bottom:8px">' + escapeHtml(truncate(p.content || p.description || '', 300)) + '</div>' +
+            '<div style="display:flex;gap:8px">' +
+            '<span style="color:var(--text-dim);font-size:12px;padding:4px 12px;border:1px solid var(--border);border-radius:4px">Status: ' + escapeHtml(p.status || 'pending') + '</span>' +
+            '</div></div>'
+        ).join('') || '<div style="color:var(--text-dim)">No pending proposals</div>';
+    } catch (e) {
+        document.getElementById('v5-reports').innerHTML =
+            '<div style="color:var(--text-dim)">Reflection tables not available: ' + escapeHtml(e.message) + '</div>';
+    }
+}
+
+</script>
+</body>
+</html>
+"""
+
+
+GRAPH_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Knowledge Graph — Claude Memory</title>
+<script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #0f172a; color: #e2e8f0; height: 100vh; overflow: hidden;
+    display: flex; flex-direction: column;
+}
+.toolbar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 20px; background: #1e293b; border-bottom: 1px solid #334155;
+    flex-shrink: 0; z-index: 10;
+}
+.toolbar h1 { font-size: 16px; font-weight: 600; white-space: nowrap; }
+.toolbar a { color: #3b82f6; text-decoration: none; font-size: 13px; }
+.toolbar a:hover { text-decoration: underline; }
+.toolbar select, .toolbar input {
+    background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+    border-radius: 6px; padding: 5px 10px; font-size: 13px;
+}
+.toolbar label { font-size: 13px; color: #94a3b8; }
+#graph-container { width: 100%; height: calc(100vh - 80px); min-height: 600px; border: 1px solid #334155; }
+#detail-panel {
+    position: absolute; top: 0; right: 0; width: 380px; height: 100%;
+    background: #1e293bee; border-left: 1px solid #334155;
+    overflow-y: auto; padding: 20px; display: none; z-index: 5;
+}
+#detail-panel.open { display: block; }
+#detail-panel h2 { font-size: 15px; margin-bottom: 8px; color: #3b82f6; }
+#detail-panel .close-btn {
+    position: absolute; top: 10px; right: 14px; cursor: pointer;
+    color: #94a3b8; font-size: 20px; background: none; border: none;
+}
+#detail-panel .close-btn:hover { color: #e2e8f0; }
+.detail-section { margin-bottom: 14px; }
+.detail-section h3 { font-size: 13px; color: #94a3b8; margin-bottom: 4px; text-transform: uppercase; }
+.detail-section p, .detail-section li { font-size: 13px; line-height: 1.5; }
+.detail-section ul { list-style: none; padding: 0; }
+.detail-section li { padding: 3px 0; border-bottom: 1px solid #33415544; }
+.badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 600; margin-right: 4px;
+}
+.stats-bar {
+    display: flex; gap: 16px; font-size: 12px; color: #94a3b8; margin-left: auto;
+}
+.stats-bar span { white-space: nowrap; }
+#loading {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    font-size: 16px; color: #94a3b8;
+}
+.legend {
+    position: absolute; bottom: 12px; left: 12px; background: #1e293bee;
+    border: 1px solid #334155; border-radius: 8px; padding: 10px 14px;
+    font-size: 11px; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px;
+}
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+    <h1>Knowledge Graph</h1>
+    <a href="/">&larr; Dashboard</a>
+    <label>Limit:
+        <select id="node-limit" onchange="loadGraph()">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+        </select>
+    </label>
+    <label>Filter type:
+        <select id="type-filter" onchange="filterGraph()">
+            <option value="">All</option>
+        </select>
+    </label>
+    <label>Search: <input id="search-input" type="text" placeholder="node name..." onkeyup="searchNode()" /></label>
+    <div class="stats-bar">
+        <span id="stat-nodes">Nodes: ...</span>
+        <span id="stat-edges">Edges: ...</span>
+    </div>
+</div>
+
+<div id="loading">Loading graph data...</div>
+<div id="graph-container"></div>
+
+<div class="legend" id="legend"></div>
+
+<div id="detail-panel">
+    <button class="close-btn" onclick="closeDetail()">&times;</button>
+    <div id="detail-content"></div>
+</div>
+
+<script>
+const TYPE_COLORS = {
+    concept:    '#3b82f6',
+    technology: '#22c55e',
+    project:    '#f97316',
+    person:     '#a855f7',
+    company:    '#ec4899',
+    pattern:    '#06b6d4',
+    skill:      '#14b8a6',
+    fact:       '#eab308',
+    solution:   '#84cc16',
+    decision:   '#f59e0b',
+    lesson:     '#ef4444',
+    convention: '#8b5cf6',
+    rule:       '#6366f1',
+    episode:    '#f43f5e',
+    repo:       '#64748b',
+    article:    '#94a3b8',
+    doc:        '#78716c',
+    preference: '#d946ef',
+    competency: '#2dd4bf',
+    blindspot:  '#fb7185',
+    prohibition:'#dc2626',
+    procedure:  '#0ea5e9',
+};
+const DEFAULT_COLOR = '#64748b';
+
+let network = null;
+let allNodes = [];
+let allEdges = [];
+let nodesDataset, edgesDataset;
+
+function getColor(type) { return TYPE_COLORS[type] || DEFAULT_COLOR; }
+
+function buildLegend(types) {
+    const el = document.getElementById('legend');
+    el.innerHTML = types.map(t =>
+        `<div class="legend-item"><div class="legend-dot" style="background:${getColor(t)}"></div>${t}</div>`
+    ).join('');
+}
+
+async function loadGraph() {
+    const limit = document.getElementById('node-limit').value;
+    document.getElementById('loading').style.display = 'block';
+
+    const resp = await fetch(`/api/graph-visual?limit=${limit}`);
+    const data = await resp.json();
+
+    allNodes = data.nodes || [];
+    allEdges = data.edges || [];
+
+    const types = [...new Set(allNodes.map(n => n.type))].sort();
+    const filterSel = document.getElementById('type-filter');
+    const curVal = filterSel.value;
+    filterSel.innerHTML = '<option value="">All</option>' +
+        types.map(t => `<option value="${t}">${t} (${allNodes.filter(n=>n.type===t).length})</option>`).join('');
+    filterSel.value = curVal;
+
+    buildLegend(types);
+    renderGraph();
+    document.getElementById('loading').style.display = 'none';
+}
+
+function renderGraph(filterType) {
+    let nodes = allNodes;
+    if (filterType) nodes = nodes.filter(n => n.type === filterType);
+    const nodeIds = new Set(nodes.map(n => n.id));
+
+    const visNodes = nodes.map(n => ({
+        id: n.id,
+        label: n.name.length > 30 ? n.name.slice(0, 28) + '..' : n.name,
+        title: `${n.name}\nType: ${n.type}\nImportance: ${(n.importance || 0).toFixed(2)}\nMentions: ${n.mention_count || 0}`,
+        color: { background: getColor(n.type), border: getColor(n.type), highlight: { background: '#fff', border: getColor(n.type) } },
+        font: { color: '#e2e8f0', size: Math.max(10, Math.min(16, 8 + (n.importance || 0.5) * 14)) },
+        size: Math.max(8, Math.min(30, 5 + (n.importance || 0.5) * 40)),
+        _data: n,
+    }));
+
+    const visEdges = allEdges
+        .filter(e => nodeIds.has(e.source_id) && nodeIds.has(e.target_id))
+        .map(e => ({
+            from: e.source_id,
+            to: e.target_id,
+            label: e.relation_type.replace(/_/g, ' '),
+            title: `${e.relation_type} (weight: ${(e.weight || 1).toFixed(1)})${e.context ? '\n' + e.context : ''}`,
+            arrows: 'to',
+            color: { color: '#475569', highlight: '#3b82f6', opacity: 0.6 },
+            font: { color: '#64748b', size: 9, strokeWidth: 0 },
+            width: Math.max(0.5, Math.min(3, (e.weight || 1))),
+            smooth: { type: 'continuous' },
+        }));
+
+    document.getElementById('stat-nodes').textContent = `Nodes: ${visNodes.length}`;
+    document.getElementById('stat-edges').textContent = `Edges: ${visEdges.length}`;
+
+    nodesDataset = new vis.DataSet(visNodes);
+    edgesDataset = new vis.DataSet(visEdges);
+
+    const container = document.getElementById('graph-container');
+    const options = {
+        physics: {
+            solver: 'forceAtlas2Based',
+            forceAtlas2Based: { gravitationalConstant: -80, centralGravity: 0.01, springLength: 120, springConstant: 0.04 },
+            stabilization: { iterations: 80, updateInterval: 25 },
+        },
+        interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true },
+        edges: { smooth: { type: 'continuous' } },
+    };
+
+    if (network) network.destroy();
+    container.style.height = (window.innerHeight - 80) + 'px';
+    network = new vis.Network(container, { nodes: nodesDataset, edges: edgesDataset }, options);
+
+    network.once('stabilizationIterationsDone', () => {
+        network.setOptions({ physics: false });
+        network.fit({ animation: { duration: 500 } });
+    });
+
+    network.on('click', async (params) => {
+        if (params.nodes.length > 0) {
+            const nodeId = params.nodes[0];
+            await showDetail(nodeId);
+        } else {
+            closeDetail();
+        }
+    });
+}
+
+function filterGraph() {
+    const filterType = document.getElementById('type-filter').value;
+    renderGraph(filterType || undefined);
+}
+
+function searchNode() {
+    const q = document.getElementById('search-input').value.toLowerCase();
+    if (!q || !network) return;
+    const found = allNodes.find(n => n.name.toLowerCase().includes(q));
+    if (found) {
+        network.selectNodes([found.id]);
+        network.focus(found.id, { scale: 1.5, animation: true });
+    }
+}
+
+async function showDetail(nodeId) {
+    const resp = await fetch(`/api/graph-node/${encodeURIComponent(nodeId)}`);
+    if (!resp.ok) { closeDetail(); return; }
+    const data = await resp.json();
+    const n = data.node;
+
+    let html = `<h2>${escHtml(n.name)}</h2>`;
+    html += `<div class="detail-section">
+        <span class="badge" style="background:${getColor(n.type)}44;color:${getColor(n.type)}">${n.type}</span>
+        <span class="badge" style="background:#33415588;color:#94a3b8">importance: ${(n.importance||0).toFixed(2)}</span>
+        <span class="badge" style="background:#33415588;color:#94a3b8">mentions: ${n.mention_count||0}</span>
+    </div>`;
+
+    if (n.content) {
+        html += `<div class="detail-section"><h3>Content</h3><p>${escHtml(n.content).slice(0, 500)}</p></div>`;
+    }
+
+    if (data.outgoing && data.outgoing.length) {
+        html += `<div class="detail-section"><h3>Outgoing (${data.outgoing.length})</h3><ul>`;
+        data.outgoing.forEach(e => {
+            html += `<li><span style="color:${getColor(e.type)}">${escHtml(e.name)}</span> <span style="color:#64748b;font-size:11px">[${e.relation_type}]</span></li>`;
+        });
+        html += `</ul></div>`;
+    }
+
+    if (data.incoming && data.incoming.length) {
+        html += `<div class="detail-section"><h3>Incoming (${data.incoming.length})</h3><ul>`;
+        data.incoming.forEach(e => {
+            html += `<li><span style="color:${getColor(e.type)}">${escHtml(e.name)}</span> <span style="color:#64748b;font-size:11px">[${e.relation_type}]</span></li>`;
+        });
+        html += `</ul></div>`;
+    }
+
+    if (n.properties) {
+        try {
+            const props = typeof n.properties === 'string' ? JSON.parse(n.properties) : n.properties;
+            if (Object.keys(props).length) {
+                html += `<div class="detail-section"><h3>Properties</h3><ul>`;
+                Object.entries(props).forEach(([k, v]) => {
+                    html += `<li><strong>${escHtml(k)}:</strong> ${escHtml(String(v))}</li>`;
+                });
+                html += `</ul></div>`;
+            }
+        } catch(e) {}
+    }
+
+    document.getElementById('detail-content').innerHTML = html;
+    document.getElementById('detail-panel').classList.add('open');
+}
+
+function closeDetail() {
+    document.getElementById('detail-panel').classList.remove('open');
+}
+
+function escHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s || '';
+    return d.innerHTML;
+}
+
+loadGraph();
 </script>
 </body>
 </html>
@@ -2057,6 +3919,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_html(HTML_PAGE)
             return
 
+        # --- Graph visualization page ---
+        if path == "/graph":
+            self._send_html(GRAPH_PAGE)
+            return
+
+        # --- System status (no DB required) ---
+        if path == "/status":
+            self._send_json(api_system_status())
+            return
+
         # --- SSE endpoint (no DB close, long-lived) ---
         if path == "/api/events":
             self._handle_sse()
@@ -2098,7 +3970,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(api_sessions(db, limit))
 
             elif path == "/api/graph":
-                self._send_json(api_graph(db))
+                limit = min(2000, max(50, int(p("limit", "1600"))))
+                self._send_json(api_graph(db, limit))
 
             elif path == "/api/errors":
                 category = p("category") or None
@@ -2127,6 +4000,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif path == "/api/branches":
                 self._send_json(api_branches(db))
 
+            elif path == "/api/graph-stats":
+                self._send_json(api_graph_stats(db))
+
+            elif path == "/api/episodes":
+                self._send_json(api_episodes(db))
+
+            elif path == "/api/skills":
+                self._send_json(api_skills(db))
+
+            elif path == "/api/self-model":
+                self._send_json(api_self_model(db))
+
+            elif path == "/api/reflection":
+                self._send_json(api_reflection(db))
+
+            elif path == "/api/graph-visual":
+                limit = min(500, max(10, int(p("limit", "100"))))
+                self._send_json(api_graph_visual(db, limit))
+
+            elif path.startswith("/api/graph-node/"):
+                from urllib.parse import unquote
+                node_id = unquote(path[len("/api/graph-node/"):])
+                if node_id:
+                    result = api_graph_node_detail(db, node_id)
+                    if result:
+                        self._send_json(result)
+                    else:
+                        self._send_error(404, "Graph node not found")
+                else:
+                    self._send_error(400, "Missing node ID")
+
             else:
                 self._send_error(404, "Not found")
         except Exception as e:
@@ -2143,6 +4047,16 @@ def main() -> None:
 
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
+        allow_reuse_address = True
+        allow_reuse_port = True
+
+        def server_bind(self) -> None:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass
+            super().server_bind()
 
     server = ThreadingHTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler)
     try:

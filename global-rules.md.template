@@ -109,3 +109,38 @@ Use `memory_observe` for quick tracking of file changes (no dedup, no embeddings
 ```
 memory_observe(tool_name="Write", summary="Modified auth middleware", observation_type="change", files_affected=["/src/auth.py"], project="<project>")
 ```
+
+### Knowledge Graph — explore connections
+
+Build and navigate a concept graph across your knowledge:
+```
+memory_graph(id=42, depth=2)          # Expand relations from a record
+memory_concepts(query="auth")         # Find concept clusters
+memory_graph_index()                  # Rebuild graph index
+memory_graph_stats()                  # Graph metrics: nodes, edges, density
+```
+
+### Episodic Memory — rich session episodes
+
+Save and recall episodes with temporal context:
+```
+memory_episode_save(title="Migration to PG18", content="Steps and issues", tags=["migration"], project="<project>")
+memory_episode_recall(query="database migration", project="<project>")
+```
+
+### Skills & Competencies
+
+Track agent skill levels across domains:
+```
+memory_skill_get(skill="docker")
+memory_skill_update(skill="docker", delta=1, reason="Solved networking issue")
+memory_self_assess()
+```
+
+### Associative Search & Context Building
+
+```
+memory_associate(query="API rate limiting")              # Associatively linked knowledge
+memory_context_build(task="implement caching", project="<project>")  # Full context bundle
+memory_reflect_now(topic="session progress", project="<project>")    # On-demand reflection
+```

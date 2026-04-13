@@ -16,7 +16,7 @@ $ErrorActionPreference = "Stop"
 
 Write-Host ""
 Write-Host "=======================================================" -ForegroundColor Cyan
-Write-Host "  Claude Total Memory v4.0 — Codex CLI Installer"       -ForegroundColor Cyan
+Write-Host "  Claude Total Memory v5.0 — Codex CLI Installer"       -ForegroundColor Cyan
 Write-Host "=======================================================" -ForegroundColor Cyan
 Write-Host ""
 

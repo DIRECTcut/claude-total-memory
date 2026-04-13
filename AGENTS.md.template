@@ -111,6 +111,57 @@ memory_relate(from_id=1, to_id=2, type="solution")      # Link related records
 memory_extract_session(action="list")                    # Pending transcript extractions
 ```
 
+## Knowledge Graph
+
+Build and explore a concept graph across your knowledge base.
+
+```
+memory_graph(id=42, depth=2)                             # Expand relations from a record (N hops)
+memory_concepts(query="authentication")                  # Find concept clusters related to a topic
+memory_graph_index()                                     # Rebuild the graph index
+memory_graph_stats()                                     # Graph metrics: nodes, edges, density
+```
+
+## Episodic Memory
+
+Save and recall rich session episodes with temporal context.
+
+```
+memory_episode_save(
+    title="Migrated database to PostgreSQL 18",
+    content="Steps taken, issues encountered, final state",
+    tags=["migration", "database"],
+    project="my-project"
+)
+
+memory_episode_recall(query="database migration", project="my-project")
+```
+
+## Skills & Competencies
+
+Track and assess the agent's skill levels across domains.
+
+```
+memory_skill_get(skill="docker")                         # Get current skill level and history
+memory_skill_update(skill="docker", delta=1, reason="Solved complex networking issue")
+memory_self_assess()                                     # Self-assessment across all tracked skills
+```
+
+## Associative Search & Context Building
+
+```
+memory_associate(query="API rate limiting")              # Find associatively linked knowledge
+memory_context_build(task="implement caching layer", project="my-project")
+    # Build a full context bundle: related knowledge, recent episodes, active rules, relevant skills
+```
+
+## Reflection
+
+```
+memory_reflect_now(topic="session progress", project="my-project")
+    # Trigger an on-demand reflection: synthesize recent activity into actionable insights
+```
+
 ## Self-Improvement (Automatic Error Learning)
 
 The agent learns from mistakes across sessions via a 3-level pipeline.
