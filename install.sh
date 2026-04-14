@@ -46,7 +46,7 @@ python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 pip install -q --upgrade pip
 echo "  Installing dependencies (this may take 2-3 minutes on first run)..."
-pip install -q "mcp[cli]>=1.0.0" chromadb sentence-transformers 2>&1 | tail -1
+pip install -q -r "$INSTALL_DIR/requirements.txt" -r "$INSTALL_DIR/requirements-dev.txt" 2>&1 | tail -1
 echo "  OK: Dependencies installed"
 
 # -- 3. Pre-download embedding model --
