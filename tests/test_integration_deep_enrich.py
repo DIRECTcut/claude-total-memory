@@ -30,7 +30,7 @@ def test_save_enqueues_deep_enrichment(store):
     )
     store.db.commit()
 
-    rid, _, _ = store.save_knowledge(
+    rid, _, _, _ = store.save_knowledge(
         sid="s1", content="content to enrich", ktype="fact", project="demo"
     )
 
@@ -57,7 +57,7 @@ def test_reflection_drains_deep_enrichment(store, monkeypatch):
         "Services are deployed via Docker Compose with health checks, metrics, "
         "and Loki log aggregation for observability."
     )
-    rid, _, _ = store.save_knowledge(
+    rid, _, _, _ = store.save_knowledge(
         sid="s1", content=long_content, ktype="fact", project="demo"
     )
 

@@ -24,7 +24,7 @@ import sqlite3
 import struct
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -190,6 +190,7 @@ class Store:
         self._fastembed_model = None  # lazy init
         self._ollama_available = None  # lazy check
         self._binary_search_ready = None  # lazy check
+        self._embed_provider = None  # lazy init (pluggable provider)
 
         # Query cache (LRU with TTL) — imported at top level
         if HAS_CACHE:
@@ -202,6 +203,12 @@ class Store:
         # Eagerly initialize embedding mode (not lazy)
         self._embed_mode = self._init_embed_mode()
         LOG(f"Embedding mode: {self._embed_mode}")
+
+        # Safety gate: refuse to run if configured provider's dim() differs
+        # from the dim already stored in the embeddings table. Prevents
+        # silent corruption when MEMORY_EMBED_PROVIDER is swapped on a
+        # live DB without re-embedding.
+        self._check_embed_dim_compat()
 
     @property
     def embedder(self):
@@ -224,12 +231,82 @@ class Store:
                 self._fastembed_model = False  # sentinel to avoid retries
         return self._fastembed_model if self._fastembed_model is not False else None
 
+    @property
+    def embed_provider(self):
+        """Lazy-init configured EmbeddingProvider (fastembed|openai|cohere).
+
+        Cached on the Store. Returns None when the configured provider is
+        unavailable at runtime (e.g. missing API key, fastembed import
+        failure) — callers must fall back to the legacy embed() paths.
+        """
+        if self._embed_provider is not None:
+            return self._embed_provider if self._embed_provider is not False else None
+        try:
+            import config as _cfg
+            from embed_provider import make_embed_provider
+            provider_name = _cfg.get_embed_provider()
+            self._embed_provider = make_embed_provider(provider_name)
+            LOG(f"Embed provider: {provider_name} ({self._embed_provider.name})")
+        except Exception as e:  # noqa: BLE001
+            LOG(f"Embed provider init failed: {e}")
+            self._embed_provider = False
+            return None
+        return self._embed_provider
+
+    def _provider_embed(self, texts):
+        """Embed via configured provider. Returns None on failure."""
+        provider = self.embed_provider
+        if provider is None:
+            return None
+        try:
+            return provider.embed(list(texts))
+        except Exception as e:  # noqa: BLE001
+            LOG(f"Embed provider error: {e}")
+            return None
+
+    def _active_embed_model_name(self):
+        """Name of the model currently writing into the embeddings table."""
+        mode = self._embed_mode
+        if mode in ("openai", "cohere"):
+            provider = self.embed_provider
+            if provider is not None:
+                return getattr(provider, "model", None) or getattr(provider, "model_name", mode)
+            return mode
+        if mode == "fastembed":
+            return FASTEMBED_MODEL
+        if mode == "ollama":
+            return OLLAMA_EMBED_MODEL
+        return EMBEDDING_MODEL
+
     def _init_embed_mode(self):
         """Eagerly determine embedding mode at startup.
 
-        Priority: FastEmbed → Ollama → SentenceTransformers
+        Priority: configured provider → FastEmbed (legacy) → Ollama → ST.
+        Default MEMORY_EMBED_PROVIDER=fastembed keeps behaviour identical
+        to pre-provider code — we still report "fastembed" mode and the
+        legacy self.fastembed property continues to back self.embed().
         """
-        # Try FastEmbed first (fastest, no server dependency)
+        # Try configured provider first. If it's fastembed (default),
+        # preserve legacy "fastembed" mode label so downstream code that
+        # branches on self._embed_mode (e.g. ChromaDB fallback, model_name
+        # tagging in _upsert_embedding) keeps working unchanged.
+        try:
+            import config as _cfg
+            configured = _cfg.get_embed_provider()
+        except Exception:
+            configured = "fastembed"
+
+        if configured == "fastembed":
+            if HAS_FASTEMBED and self.fastembed:
+                return "fastembed"
+        elif configured in ("openai", "cohere"):
+            provider = self.embed_provider
+            if provider is not None and provider.available():
+                return configured
+            LOG(f"Embed provider {configured} unavailable — falling back to legacy chain")
+
+        # Legacy fallback chain — kept so tests that run without any
+        # provider-specific env vars still light up local fastembed.
         if HAS_FASTEMBED and self.fastembed:
             return "fastembed"
 
@@ -248,6 +325,44 @@ class Store:
         if self.embedder:
             return "st"
         return "none"
+
+    def _check_embed_dim_compat(self):
+        """Refuse to boot if provider dim() mismatches stored embed_dim.
+
+        Reads one row from the embeddings table. If the configured
+        EmbeddingProvider reports a different dim than what's already
+        stored, raises RuntimeError with a re-embed hint. An empty table
+        (fresh DB) or an unavailable provider (no dim known yet) silently
+        accept whatever comes next.
+        """
+        provider = self.embed_provider
+        if provider is None:
+            return
+        provider_dim = 0
+        try:
+            provider_dim = provider.dim()
+        except Exception:  # noqa: BLE001
+            provider_dim = 0
+        if not provider_dim:
+            return  # provider dim unknown — skip gate
+
+        try:
+            row = self.db.execute(
+                "SELECT embed_dim FROM embeddings LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return  # table not ready — nothing to guard
+        if row is None:
+            return  # fresh DB — new dim is fine
+
+        stored_dim = int(row[0])
+        if stored_dim != provider_dim:
+            raise RuntimeError(
+                f"Embedding dimension mismatch: stored={stored_dim}, "
+                f"provider={provider_dim}. Re-embed via "
+                f"tools/reembed.py --dim {provider_dim} or revert "
+                f"MEMORY_EMBED_PROVIDER."
+            )
 
     def _check_ollama(self):
         """Check if Ollama is running and has the embedding model."""
@@ -304,7 +419,19 @@ class Store:
             return None
 
     def embed(self, texts):
-        """Get embeddings. Priority: FastEmbed → Ollama → SentenceTransformers."""
+        """Get embeddings.
+
+        Dispatch order:
+          1. Cloud providers (openai / cohere) via EmbeddingProvider when selected.
+          2. Legacy FastEmbed → Ollama → SentenceTransformers chain.
+        """
+        # Cloud providers route through EmbeddingProvider.
+        if self._embed_mode in ("openai", "cohere"):
+            result = self._provider_embed(texts)
+            if result:
+                return result
+            # Cloud failed at runtime — fall through to local fallbacks.
+
         if self._embed_mode == "fastembed":
             result = self._fastembed_embed(texts)
             if result:
@@ -317,7 +444,7 @@ class Store:
             if result:
                 return result
             # Fallback to ST if Ollama fails at runtime
-        if self._embed_mode in ("st", "ollama", "fastembed") and self.embedder:
+        if self._embed_mode in ("st", "ollama", "fastembed", "openai", "cohere") and self.embedder:
             try:
                 return self.embedder.encode(texts).tolist()
             except Exception:
@@ -370,7 +497,7 @@ class Store:
         """Store binary + float32 vectors for a knowledge record."""
         binary_blob = self._quantize_binary(embedding)
         float32_blob = self._float32_to_blob(embedding)
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.db.execute("""
             INSERT OR REPLACE INTO embeddings (knowledge_id, binary_vector, float32_vector,
                                                embed_model, embed_dim, created_at)
@@ -785,7 +912,7 @@ class Store:
         return dict(r) if r else None
 
     def raw_append(self, sid, entry):
-        entry["_ts"] = datetime.utcnow().isoformat() + "Z"
+        entry["_ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         p = MEMORY_DIR / "raw" / f"{sid}.jsonl"
         with open(p, "a") as f:
             f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
@@ -793,7 +920,7 @@ class Store:
             os.fsync(f.fileno())
 
     def session_start(self, sid, project="general", branch=""):
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.db.execute(
             "INSERT OR IGNORE INTO sessions (id,started_at,project,branch) VALUES (?,?,?,?)",
             (sid, now, project, branch))
@@ -854,7 +981,7 @@ class Store:
             return 0.5
         try:
             lc = datetime.fromisoformat(last_confirmed_str.replace("Z", "+00:00"))
-            now = datetime.now(lc.tzinfo) if lc.tzinfo else datetime.utcnow()
+            now = datetime.now(lc.tzinfo) if lc.tzinfo else datetime.now(timezone.utc).replace(tzinfo=None)
             days = (now - lc.replace(tzinfo=None)).days if not lc.tzinfo else (now - lc).days
             return max(0.01, math.exp(-days * math.log(2) / half_life_days))
         except Exception:
@@ -864,13 +991,33 @@ class Store:
 
     def save_knowledge(self, sid, content, ktype, project="general", tags=None,
                         context="", branch="", skip_dedup=False, filter_name=None):
-        """Save knowledge. Returns (record_id, was_deduplicated, was_redacted).
+        """Save knowledge. Returns (record_id, was_deduplicated, was_redacted, private_sections).
 
         Optional `filter_name` runs the content through a TOML-defined
         rtk-style pipeline BEFORE dedup/save — shrinks noisy CLI output
         (pytest, cargo, etc.) while a hard whitelist keeps URLs/paths/code.
         """
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        # Inline <private>...</private> tag redaction (P0.1) — BEFORE autofilter/dedup/sanitize
+        private_sections = 0
+        try:
+            from privacy_filter import redact_private_sections as _rps
+            content, _pc = _rps(content)
+            context, _px = _rps(context)
+            private_sections = _pc + _px
+            if private_sections > 0:
+                sys.stderr.write(f"[private-tag] redacted {private_sections} sections\n")
+                try:
+                    self.db.execute(
+                        "UPDATE privacy_counters SET value = value + ?, updated_at = ? WHERE key = ?",
+                        (private_sections, now, "private_redactions_total"),
+                    )
+                    self.db.commit()
+                except Exception as e:
+                    LOG(f"privacy_counters update error: {e}")
+        except Exception as e:
+            LOG(f"private-tag redaction error: {e}")
 
         # Optional content filter (token-saving preprocessor)
         # Auto-detect filter when caller didn't specify one.
@@ -914,7 +1061,7 @@ class Store:
                 self.db.execute("UPDATE knowledge SET last_confirmed=? WHERE id=?", (now, dup_id))
                 self.db.commit()
                 LOG(f"Dedup: updated last_confirmed for id={dup_id}")
-                return dup_id, True, was_redacted
+                return dup_id, True, was_redacted, private_sections
 
         cur = self.db.execute("""
             INSERT INTO knowledge (session_id,type,content,context,project,tags,source,confidence,
@@ -926,8 +1073,7 @@ class Store:
 
         embs = self.embed([f"{content} {context}"])
         if embs:
-            model_name = FASTEMBED_MODEL if self._embed_mode == "fastembed" else (
-                OLLAMA_EMBED_MODEL if self._embed_mode == "ollama" else EMBEDDING_MODEL)
+            model_name = self._active_embed_model_name()
             self._upsert_embedding(rid, embs[0], model_name)
             self.db.commit()
             if self.chroma and not self._check_binary_search():
@@ -998,11 +1144,11 @@ class Store:
             except Exception as e:
                 LOG(f"filter_savings log error: {e}")
 
-        return rid, False, was_redacted
+        return rid, False, was_redacted, private_sections
 
     def bump_recall(self, ids):
         """Strengthen memories that are recalled (spaced repetition effect)."""
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         for kid in ids:
             self.db.execute(
                 "UPDATE knowledge SET recall_count=recall_count+1, last_recalled=?, last_confirmed=? WHERE id=?",
@@ -1040,7 +1186,7 @@ class Store:
     def consolidate_group(self, sid, group):
         """Merge a group of similar records: keep longest, supersede rest."""
         longest = max(group, key=lambda r: len(r["content"]))
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.db.execute("UPDATE knowledge SET last_confirmed=? WHERE id=?", (now, longest["id"]))
         merged_ids = []
         for r in group:
@@ -1062,9 +1208,9 @@ class Store:
 
     def apply_retention(self):
         """Move old unconfirmed records: active→archived→purged."""
-        now = datetime.utcnow()
-        archive_cutoff = (now - timedelta(days=ARCHIVE_AFTER_DAYS)).isoformat() + "Z"
-        purge_cutoff = (now - timedelta(days=PURGE_AFTER_DAYS)).isoformat() + "Z"
+        now = datetime.now(timezone.utc)
+        archive_cutoff = (now - timedelta(days=ARCHIVE_AFTER_DAYS)).isoformat().replace("+00:00", "Z")
+        purge_cutoff = (now - timedelta(days=PURGE_AFTER_DAYS)).isoformat().replace("+00:00", "Z")
 
         archived = self.db.execute("""
             UPDATE knowledge SET status='archived'
@@ -1110,7 +1256,7 @@ class Store:
         sessions = self.q("SELECT * FROM sessions ORDER BY started_at")
         return {
             "version": "2.1",
-            "exported_at": datetime.utcnow().isoformat() + "Z",
+            "exported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "knowledge": rows,
             "sessions": sessions,
             "relations": self.q("SELECT * FROM relations"),
@@ -1167,7 +1313,7 @@ class Store:
 
     def add_relation(self, from_id, to_id, rel_type):
         """Create a relation between two knowledge records."""
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         # Verify both records exist
         if not self.q1("SELECT id FROM knowledge WHERE id=?", (from_id,)):
             return {"error": f"Record {from_id} not found"}
@@ -1217,7 +1363,7 @@ class Store:
     def save_observation(self, sid, tool_name, summary, observation_type="change",
                          files_affected=None, project="general", branch=""):
         """Save a lightweight observation (no dedup, no ChromaDB)."""
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         summary, _ = self._sanitize_content(summary)
         cur = self.db.execute("""
             INSERT INTO observations (session_id, tool_name, observation_type, summary,
@@ -1230,7 +1376,7 @@ class Store:
 
     def cleanup_old_observations(self):
         """Remove observations older than OBSERVATION_RETENTION_DAYS."""
-        cutoff = (datetime.utcnow() - timedelta(days=OBSERVATION_RETENTION_DAYS)).isoformat() + "Z"
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=OBSERVATION_RETENTION_DAYS)).isoformat().replace("+00:00", "Z")
         deleted = self.db.execute(
             "DELETE FROM observations WHERE created_at < ?", (cutoff,)).rowcount
         self.db.commit()
@@ -1243,7 +1389,7 @@ class Store:
     def log_error(self, sid, description, category, severity="medium",
                   fix="", context="", project="general", tags=None):
         """Log a structured error and check for patterns."""
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         status = "resolved" if fix else "open"
         cur = self.db.execute("""
             INSERT INTO errors (session_id, category, severity, description, context,
@@ -1258,7 +1404,7 @@ class Store:
 
     def detect_error_pattern(self, category, project="general"):
         """Detect repeating error patterns (3+ same category in 30 days)."""
-        cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z"
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace("+00:00", "Z")
         row = self.db.execute("""
             SELECT COUNT(*) as cnt, GROUP_CONCAT(id) as ids
             FROM errors
@@ -1311,7 +1457,7 @@ class Store:
 
     def manage_insight(self, sid, action, **kw):
         """ExpeL-style insight management: add/upvote/downvote/edit/list/promote."""
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         if action == "add":
             content = kw["content"]
@@ -1402,7 +1548,7 @@ class Store:
 
     def promote_insight_to_rule(self, sid, insight_id):
         """Promote a high-value insight to a behavioral rule."""
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         insight = self.q1("SELECT * FROM insights WHERE id=? AND status='active'", (insight_id,))
         if not insight:
             return {"error": "Insight not found or not active"}
@@ -1435,7 +1581,7 @@ class Store:
 
     def manage_rule(self, sid, action, **kw):
         """Manage behavioral rules (SOUL)."""
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         if action == "list":
             conds, params = ["status='active'"], []
@@ -1517,8 +1663,23 @@ class Store:
 
         return {"error": f"Unknown action: {action}"}
 
-    def get_rules_for_context(self, project="general", categories=None):
-        """Get active rules relevant to current context."""
+    def get_rules_for_context(self, project="general", categories=None, phase=None):
+        """Get active rules relevant to current context.
+
+        Args:
+            project: filter by project scope (plus 'global' rules).
+            categories: extra scope filters (category:<name>).
+            phase: optional phase filter (v8.0 lazy rule loading). When set, returns
+                core rules (no 'phase:*' tag) plus rules tagged 'phase:<phase>'.
+                Expected values: van|plan|creative|build|reflect|archive.
+        """
+        VALID_PHASES = {"van", "plan", "creative", "build", "reflect", "archive"}
+        if phase is not None and phase not in VALID_PHASES:
+            return {
+                "error": f"Unknown phase '{phase}'. "
+                         f"Expected one of: {sorted(VALID_PHASES)}",
+            }
+
         scopes = ["'global'", f"'project:{project}'"]
         if categories:
             scopes.extend(f"'category:{c}'" for c in categories)
@@ -1527,17 +1688,80 @@ class Store:
             WHERE status='active' AND scope IN ({','.join(scopes)})
             ORDER BY priority DESC, success_rate DESC LIMIT 20
         """)
-        now = datetime.utcnow().isoformat() + "Z"
+
+        if phase is not None:
+            # Tag-based routing: a rule is phase-specific iff it has a tag
+            # matching "phase:<X>". Rules without any "phase:*" tag are core
+            # and apply to every phase.
+            filtered = []
+            for r in rows:
+                try:
+                    tags = json.loads(r.get("tags") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    tags = []
+                phase_tags = [t for t in tags if isinstance(t, str) and t.startswith("phase:")]
+                if not phase_tags:
+                    filtered.append(r)  # core rule — always included
+                elif f"phase:{phase}" in phase_tags:
+                    filtered.append(r)  # matches current phase
+                # else: rule is scoped to a different phase — skip
+            rows = filtered
+
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         for r in rows:
             self.db.execute(
                 "UPDATE rules SET fire_count=fire_count+1, last_fired=?, updated_at=? WHERE id=?",
                 (now, now, r["id"]))
         self.db.commit()
-        return {"rules_count": len(rows), "rules": rows}
+        result = {"rules_count": len(rows), "rules": rows}
+        if phase is not None:
+            result["phase_filter"] = phase
+        return result
+
+    def set_rule_phase(self, rule_id, phase):
+        """Set or clear the phase of a rule (v8.0 lazy rule loading).
+
+        Tag-based: manages the "phase:<X>" tag on the rule's tags JSON list.
+        - phase=None   → remove any "phase:*" tag (rule becomes core).
+        - phase="build"→ replace any existing "phase:*" tag with "phase:build".
+
+        Returns:
+            dict with rule_id, phase (or None), updated flag.
+        """
+        VALID_PHASES = {"van", "plan", "creative", "build", "reflect", "archive"}
+        if phase is not None and phase not in VALID_PHASES:
+            return {
+                "error": f"Unknown phase '{phase}'. "
+                         f"Expected one of: {sorted(VALID_PHASES)} or null",
+            }
+
+        row = self.q1("SELECT id, tags FROM rules WHERE id=?", (rule_id,))
+        if not row:
+            return {"error": f"Rule {rule_id} not found", "rule_id": rule_id}
+
+        try:
+            tags = json.loads(row.get("tags") or "[]")
+            if not isinstance(tags, list):
+                tags = []
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+
+        # Strip any existing phase:* tags
+        tags = [t for t in tags if not (isinstance(t, str) and t.startswith("phase:"))]
+        if phase is not None:
+            tags.append(f"phase:{phase}")
+
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.db.execute(
+            "UPDATE rules SET tags=?, updated_at=? WHERE id=?",
+            (json.dumps(tags), now, rule_id),
+        )
+        self.db.commit()
+        return {"rule_id": rule_id, "phase": phase, "updated": True}
 
     def analyze_patterns(self, view="full_report", project=None, days=30):
         """Analyze error patterns and self-improvement metrics."""
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
         pf = "AND project=?" if project else ""
         pp = (project,) if project else ()
         result = {}
@@ -1581,8 +1805,8 @@ class Store:
         if view in ("improvement_trend", "full_report"):
             weeks = []
             for w in range(4):
-                start = (datetime.utcnow() - timedelta(days=(w+1)*7)).isoformat() + "Z"
-                end = (datetime.utcnow() - timedelta(days=w*7)).isoformat() + "Z"
+                start = (datetime.now(timezone.utc) - timedelta(days=(w+1)*7)).isoformat().replace("+00:00", "Z")
+                end = (datetime.now(timezone.utc) - timedelta(days=w*7)).isoformat().replace("+00:00", "Z")
                 cnt = self.db.execute(f"""
                     SELECT COUNT(*) FROM errors WHERE created_at BETWEEN ? AND ? {pf}
                 """, (start, end, *pp)).fetchone()[0]
@@ -2318,10 +2542,18 @@ async def list_tools():
                     "type": {"type": "string", "enum": ["decision", "fact", "solution", "lesson", "convention", "all"],
                              "default": "all"},
                     "limit": {"type": "integer", "default": 10},
+                    "mode": {"type": "string", "enum": ["search", "index", "timeline"], "default": "search",
+                             "description": "Progressive-disclosure mode: 'search' (default) = normal results, "
+                                            "'index' = ultra-compact metadata only (id+title+score+type+project+created_at, "
+                                            "~40-60 tok/hit, no cognitive expansion, use memory_get(ids=...) to fetch full content), "
+                                            "'timeline' = top-K hits expanded with ±neighbors from same session (chronological)"},
+                    "neighbors": {"type": "integer", "default": 2,
+                                  "description": "Timeline mode only: how many records before/after each hit to include."},
                     "detail": {"type": "string", "enum": ["compact", "summary", "full", "auto"], "default": "full",
                                "description": "Level of detail: 'compact' ~50 tokens/result (id+title+score), "
                                               "'summary' truncates content to 150 chars, 'full' returns everything, "
-                                              "'auto' picks based on query complexity (paths/urls/code → full, short → compact)"},
+                                              "'auto' picks based on query complexity (paths/urls/code → full, short → compact). "
+                                              "Ignored when mode!='search'."},
                     "branch": {"type": "string", "description": "Filter by git branch (also includes branch-agnostic records)"},
                     "fusion": {"type": "string", "enum": ["rrf", "legacy"], "default": "rrf",
                                "description": "Score fusion method: 'rrf' = Reciprocal Rank Fusion (better multi-tier ranking), "
@@ -2340,6 +2572,9 @@ async def list_tools():
                                  "description": "Filter by extracted entity names (technology/person/project, case-insensitive)"},
                     "intent": {"type": "string",
                                "description": "Filter by classified intent (question|procedural|fact|decision|problem|solution|incident|plan)"},
+                    "decisions_only": {"type": "boolean", "default": False,
+                                       "description": "Return only structured decisions (v8.0): type=decision AND tags contain 'structured'. "
+                                                      "Results include parsed schema payload under 'decision'."},
                 },
                 "required": ["query"],
             },
@@ -2433,6 +2668,22 @@ async def list_tools():
                 "properties": {
                     "dry_run": {"type": "boolean", "description": "If true, only show what would be affected", "default": True},
                 },
+            },
+        ),
+        Tool(
+            name="memory_get",
+            description="Batched fetch by ID — complement to memory_recall(mode='index'). "
+                        "Returns full content for ONLY the IDs the caller chose after inspecting an index. "
+                        "Typical 3-layer flow: recall(mode='index') → pick IDs → memory_get(ids=[...]).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ids": {"type": "array", "items": {"type": "integer"},
+                            "description": "Knowledge record IDs (max 50 per call; extras are silently dropped)"},
+                    "detail": {"type": "string", "enum": ["summary", "full"], "default": "full",
+                               "description": "'summary' truncates content to 150 chars, 'full' returns everything"},
+                },
+                "required": ["ids"],
             },
         ),
         Tool(
@@ -2631,6 +2882,8 @@ async def list_tools():
             name="self_rules_context",
             description="Get active behavioral rules for current session. "
                         "Call at SESSION START to load rules. Returns rules filtered by project and scope. "
+                        "v8.0: pass `phase` to lazy-load rules relevant to current task phase — core "
+                        "rules (no phase tag) + rules tagged phase:<X>. Cuts prompt tokens ~70%. "
                         "After task completion, rate rules: self_rules(action='rate', id=X, success=true/false).",
             inputSchema={
                 "type": "object",
@@ -2638,7 +2891,29 @@ async def list_tools():
                     "project": {"type": "string", "default": "general"},
                     "categories": {"type": "array", "items": {"type": "string"},
                                    "description": "Error categories relevant to current task"},
+                    "phase": {"type": "string",
+                              "enum": ["van", "plan", "creative", "build", "reflect", "archive"],
+                              "description": "Optional: lazy-load only rules relevant to this phase "
+                                             "(core + phase-specific). Omit to get all rules."},
                 },
+            },
+        ),
+        Tool(
+            name="rule_set_phase",
+            description="Attach or remove a phase scope on a rule (v8.0 lazy rule loading). "
+                        "Tag-based: manages 'phase:<X>' on the rule's tags. "
+                        "phase=null clears the phase tag (rule becomes core — applies to every phase). "
+                        "Valid phases: van, plan, creative, build, reflect, archive.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "rule_id": {"type": "integer"},
+                    "phase": {"type": ["string", "null"],
+                              "enum": ["van", "plan", "creative", "build",
+                                       "reflect", "archive", None],
+                              "description": "Phase name or null to clear."},
+                },
+                "required": ["rule_id"],
             },
         ),
         # ── Observations ──
@@ -2997,7 +3272,10 @@ async def list_tools():
         Tool(
             name="session_end",
             description="End-of-session capture: summary + highlights + pitfalls + next_steps "
-                        "so the next session can resume cleanly.",
+                        "so the next session can resume cleanly. "
+                        "Set auto_compress=true to have the LLM generate the missing "
+                        "summary/next_steps/pitfalls from stored session artifacts "
+                        "(or from an optional `transcript`).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -3008,8 +3286,10 @@ async def list_tools():
                     "next_steps": {"type": "array", "items": {"type": "string"}},
                     "open_questions": {"type": "array", "items": {"type": "string"}},
                     "project": {"type": "string", "default": "general"},
+                    "auto_compress": {"type": "boolean", "default": False},
+                    "transcript": {"type": "string"},
                 },
-                "required": ["session_id", "summary"],
+                "required": ["session_id"],
             },
         ),
         # ── v7.0 AST ingest ──
@@ -3059,6 +3339,92 @@ async def list_tools():
                 },
             },
         ),
+        Tool(name="classify_task", description="v8.0: classify task into L1-L4 complexity + suggested phases.", inputSchema={"type": "object", "properties": {"description": {"type": "string"}, "project": {"type": "string"}}, "required": ["description"]}),
+        Tool(name="task_create", description="v8.0: start a task in `van` phase (auto-classifies level if missing).", inputSchema={"type": "object", "properties": {"task_id": {"type": "string"}, "description": {"type": "string"}, "level": {"type": "integer"}}, "required": ["task_id", "description"]}),
+        Tool(name="phase_transition", description="v8.0: advance a task to the next phase.", inputSchema={"type": "object", "properties": {"task_id": {"type": "string"}, "new_phase": {"type": "string"}, "artifacts": {"type": "object"}, "notes": {"type": "string"}}, "required": ["task_id", "new_phase"]}),
+        Tool(name="task_phases_list", description="v8.0: list all phases of a task in chronological order.", inputSchema={"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}),
+        Tool(
+            name="save_intent",
+            description="Persist one user prompt into the `intents` table (same source as the "
+                        "UserPromptSubmit hook). Use when programmatically seeding intents — the "
+                        "hook covers normal interactive usage. Dedupes same prompt within 5 min per session.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "User prompt text as submitted"},
+                    "session_id": {"type": "string", "description": "Session id (defaults to current MCP session)"},
+                    "project": {"type": "string", "description": "Project slug"},
+                },
+                "required": ["prompt"],
+            },
+        ),
+        Tool(
+            name="list_intents",
+            description="List recent user prompts from the intents table, newest first. "
+                        "Filter by project and/or session. Max 500 rows.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+        ),
+        Tool(
+            name="search_intents",
+            description="Substring search over user prompts (LIKE). Returns newest match first. "
+                        "Useful for 'what did I ask about X' without mining transcripts.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Substring to match in prompt text"},
+                    "project": {"type": "string"},
+                    "limit": {"type": "integer", "default": 20},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="save_decision",
+            description="v8.0: save a structured architectural decision (options + criteria matrix + "
+                        "rationale + discarded). Adds `structured` tag and a JSON blob in context. "
+                        "Use for Creative-phase outputs; plain type=decision memory_save still works.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short decision title"},
+                    "options": {
+                        "type": "array",
+                        "description": "Options considered: [{name, pros[], cons[], unknowns[]}, ...]",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "pros": {"type": "array", "items": {"type": "string"}},
+                                "cons": {"type": "array", "items": {"type": "string"}},
+                                "unknowns": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                    "criteria_matrix": {
+                        "type": "object",
+                        "description": "criterion -> {option_name: rating 0-5}",
+                    },
+                    "selected": {"type": "string", "description": "Chosen option name (must be in options)"},
+                    "rationale": {"type": "string", "description": "Why this option was chosen"},
+                    "discarded": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Option names rejected (subset of options - {selected})",
+                    },
+                    "project": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "options", "criteria_matrix", "selected", "rationale"],
+            },
+        ),
     ]
 
 
@@ -3077,6 +3443,10 @@ async def _do(name, a):
     J = lambda x: json.dumps(x, ensure_ascii=False, indent=2, default=str)
 
     if name == "memory_recall":
+        mode_param = a.get("mode", "search")
+        if mode_param not in ("search", "index", "timeline"):
+            mode_param = "search"
+
         detail_param = a.get("detail", "full")
         if detail_param == "auto":
             try:
@@ -3086,8 +3456,12 @@ async def _do(name, a):
                 LOG(f"auto-verbosity failed: {e}")
                 detail_param = "full"
 
+        # For index/timeline we need full records to build compact views / fetch
+        # neighbours. Underlying search runs at "full" detail regardless of the
+        # caller's detail= for those modes.
+        search_detail = "full" if mode_param != "search" else detail_param
         result = recall.search(a["query"], a.get("project"), a.get("type", "all"),
-                               a.get("limit", 10), detail_param,
+                               a.get("limit", 10), search_detail,
                                a.get("branch"), a.get("fusion", "rrf"),
                                a.get("rerank", False), a.get("diverse", False))
         if a.get("detail") == "auto":
@@ -3127,39 +3501,42 @@ async def _do(name, a):
             except Exception as e:
                 LOG(f"Enrichment filter error: {e}")
 
-        # Enrich with CognitiveEngine associative activation
-        try:
-            ce = _get_v5("cognitive", store.db)
-            cognitive_ctx = ce.on_query(a["query"], a.get("project"))
-            # Append cognitive enrichment to result
-            enrichment = {}
-            if cognitive_ctx.get("activated_concepts"):
-                enrichment["activated_concepts"] = cognitive_ctx["activated_concepts"][:10]
-            if cognitive_ctx.get("relevant_rules"):
-                enrichment["relevant_rules"] = cognitive_ctx["relevant_rules"]
-            if cognitive_ctx.get("past_failures"):
-                enrichment["past_failures"] = cognitive_ctx["past_failures"]
-            if cognitive_ctx.get("available_solutions"):
-                # Deduplicate against already-returned results
-                existing_ids = set()
-                for group in result.get("results", {}).values():
-                    for item in group:
-                        existing_ids.add(item.get("id"))
-                enrichment["additional_solutions"] = [
-                    s for s in cognitive_ctx["available_solutions"]
-                    if s.get("id") not in existing_ids
-                ][:5]
-            if cognitive_ctx.get("applicable_skills"):
-                enrichment["applicable_skills"] = cognitive_ctx["applicable_skills"]
-            if cognitive_ctx.get("competency"):
-                enrichment["competency"] = cognitive_ctx["competency"]
-            if enrichment:
-                result["cognitive"] = enrichment
-        except Exception as e:
-            LOG(f"CognitiveEngine enrichment error: {e}")
+        # Enrich with CognitiveEngine associative activation.
+        # Skip for index/timeline modes — those are intentionally minimal.
+        if mode_param == "search":
+            try:
+                ce = _get_v5("cognitive", store.db)
+                cognitive_ctx = ce.on_query(a["query"], a.get("project"))
+                # Append cognitive enrichment to result
+                enrichment = {}
+                if cognitive_ctx.get("activated_concepts"):
+                    enrichment["activated_concepts"] = cognitive_ctx["activated_concepts"][:10]
+                if cognitive_ctx.get("relevant_rules"):
+                    enrichment["relevant_rules"] = cognitive_ctx["relevant_rules"]
+                if cognitive_ctx.get("past_failures"):
+                    enrichment["past_failures"] = cognitive_ctx["past_failures"]
+                if cognitive_ctx.get("available_solutions"):
+                    # Deduplicate against already-returned results
+                    existing_ids = set()
+                    for group in result.get("results", {}).values():
+                        for item in group:
+                            existing_ids.add(item.get("id"))
+                    enrichment["additional_solutions"] = [
+                        s for s in cognitive_ctx["available_solutions"]
+                        if s.get("id") not in existing_ids
+                    ][:5]
+                if cognitive_ctx.get("applicable_skills"):
+                    enrichment["applicable_skills"] = cognitive_ctx["applicable_skills"]
+                if cognitive_ctx.get("competency"):
+                    enrichment["competency"] = cognitive_ctx["competency"]
+                if enrichment:
+                    result["cognitive"] = enrichment
+            except Exception as e:
+                LOG(f"CognitiveEngine enrichment error: {e}")
 
-        # Optional graph-based context expansion (1-hop neighbors)
-        if a.get("expand_context"):
+        # Optional graph-based context expansion (1-hop neighbors).
+        # Also skipped for index/timeline modes (callers opt-in to lightweight output).
+        if mode_param == "search" and a.get("expand_context"):
             try:
                 from context_expander import ContextExpander
 
@@ -3201,6 +3578,70 @@ async def _do(name, a):
             except Exception as e:
                 LOG(f"Context expansion error: {e}")
 
+        # Structured-decisions-only filter (v8.0): narrow to type=decision
+        # with the 'structured' tag and attach parsed schema payload.
+        if a.get("decisions_only"):
+            try:
+                from decisions import parse_stored_decision, STRUCTURED_TAG
+
+                # Rebuild result on a shallow copy so we never mutate the
+                # cached value (cache key does not include decisions_only).
+                result = {**result}
+                filtered_groups: dict[str, list[dict]] = {}
+                for group_name, group in result.get("results", {}).items():
+                    # `results` is grouped by type — drop non-decision buckets.
+                    if group_name != "decision":
+                        continue
+                    kept: list[dict] = []
+                    for item in group:
+                        raw_tags = item.get("tags", [])
+                        if isinstance(raw_tags, str):
+                            try:
+                                raw_tags = json.loads(raw_tags)
+                            except Exception:
+                                raw_tags = []
+                        if STRUCTURED_TAG not in (raw_tags or []):
+                            continue
+                        kid = item.get("id")
+                        ctx = item.get("context") or ""
+                        if (not ctx) and isinstance(kid, int):
+                            ctx_row = store.db.execute(
+                                "SELECT context FROM knowledge WHERE id=?", (kid,)
+                            ).fetchone()
+                            if ctx_row is not None:
+                                ctx = ctx_row["context"] or ""
+                        parsed = parse_stored_decision(ctx)
+                        if parsed is None:
+                            continue
+                        enriched = dict(item)
+                        enriched["decision"] = parsed
+                        kept.append(enriched)
+                    filtered_groups[group_name] = kept
+                result["results"] = filtered_groups
+                result["total"] = sum(len(g) for g in filtered_groups.values())
+                result["decisions_only"] = True
+            except Exception as e:
+                LOG(f"decisions_only filter error: {e}")
+
+        # Progressive-disclosure mode transforms — applied last so they observe
+        # all filters (enrichment, decisions_only) but strip heavy fields.
+        if mode_param == "index":
+            try:
+                from recall_modes import index_response
+                result = index_response(result)
+            except Exception as e:
+                LOG(f"index_response error: {e}")
+        elif mode_param == "timeline":
+            try:
+                from recall_modes import timeline_response
+                result = timeline_response(
+                    result, store,
+                    neighbors=int(a.get("neighbors", 2)),
+                    limit=int(a.get("limit", 5)),
+                )
+            except Exception as e:
+                LOG(f"timeline_response error: {e}")
+
         return J(result)
 
     elif name == "memory_timeline":
@@ -3209,7 +3650,7 @@ async def _do(name, a):
         return J(recall.timeline(**kwargs))
 
     elif name == "memory_save":
-        rid, was_dedup, was_redacted = store.save_knowledge(
+        rid, was_dedup, was_redacted, private_sections = store.save_knowledge(
             SID, a["content"], a["type"],
             a.get("project", "general"), a.get("tags", []), a.get("context", ""),
             branch=a.get("branch", BRANCH), filter_name=a.get("filter"))
@@ -3219,6 +3660,8 @@ async def _do(name, a):
         result = {"saved": True, "id": rid, "deduplicated": was_dedup}
         if was_redacted:
             result["privacy_redacted"] = True
+        if private_sections:
+            result["privacy_redacted_sections"] = private_sections
 
         # Auto-update SelfModel competencies for solution/lesson saves
         if a["type"] in ("solution", "lesson") and not was_dedup:
@@ -3252,7 +3695,7 @@ async def _do(name, a):
         old_rec = store.q1("SELECT * FROM knowledge WHERE id=?", (old["id"],))
         if not old_rec:
             return J({"error": "Record not found in DB"})
-        new_id, _, _ = store.save_knowledge(
+        new_id, _, _, _ = store.save_knowledge(
             SID, a["new_content"], old_rec["type"], old_rec["project"],
             json.loads(old_rec.get("tags", "[]")),
             f"Updated: {a.get('reason', '')}. Was: {old_rec['content'][:200]}",
@@ -3302,7 +3745,7 @@ async def _do(name, a):
         data = store.export_all(a.get("project"))
         save = a.get("save_to_file", True)
         if save:
-            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             proj = a.get("project", "all")
             path = MEMORY_DIR / "backups" / f"export_{proj}_{ts}.json"
             with open(path, "w") as f:
@@ -3315,8 +3758,8 @@ async def _do(name, a):
     elif name == "memory_forget":
         dry_run = a.get("dry_run", True)
         if dry_run:
-            archive_cutoff = (datetime.utcnow() - timedelta(days=ARCHIVE_AFTER_DAYS)).isoformat() + "Z"
-            purge_cutoff = (datetime.utcnow() - timedelta(days=PURGE_AFTER_DAYS)).isoformat() + "Z"
+            archive_cutoff = (datetime.now(timezone.utc) - timedelta(days=ARCHIVE_AFTER_DAYS)).isoformat().replace("+00:00", "Z")
+            purge_cutoff = (datetime.now(timezone.utc) - timedelta(days=PURGE_AFTER_DAYS)).isoformat().replace("+00:00", "Z")
             would_archive = store.db.execute("""
                 SELECT COUNT(*) FROM knowledge
                 WHERE status='active' AND last_confirmed < ? AND recall_count = 0 AND confidence < 0.8
@@ -3329,6 +3772,70 @@ async def _do(name, a):
         else:
             result = store.apply_retention()
             return J({"applied": True, **result})
+
+    elif name == "memory_get":
+        raw_ids = a.get("ids") or []
+        if not isinstance(raw_ids, list):
+            raw_ids = []
+        # Normalize + cap at 50 to bound response size / SQL IN() expansion.
+        ids: list[int] = []
+        seen_ids: set[int] = set()
+        for v in raw_ids:
+            try:
+                iv = int(v)
+            except Exception:
+                continue
+            if iv in seen_ids:
+                continue
+            seen_ids.add(iv)
+            ids.append(iv)
+            if len(ids) >= 50:
+                break
+        detail = a.get("detail", "full")
+        if detail not in ("summary", "full"):
+            detail = "full"
+        if not ids:
+            return J({"total": 0, "detail": detail, "results": []})
+        placeholders = ",".join("?" * len(ids))
+        rows = store.db.execute(
+            f"SELECT id, session_id, type, content, context, project, tags, "
+            f"status, confidence, created_at, last_confirmed, recall_count, branch "
+            f"FROM knowledge WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        # Preserve caller order; silently skip missing IDs.
+        by_id = {r["id"]: r for r in rows}
+        out: list[dict] = []
+        for kid in ids:
+            r = by_id.get(kid)
+            if r is None:
+                continue
+            tags = r["tags"] if "tags" in r.keys() else "[]"
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except Exception:
+                    tags = []
+            content = r["content"] or ""
+            if detail == "summary":
+                content = content[:150] + ("..." if len(r["content"] or "") > 150 else "")
+            entry = {
+                "id": r["id"], "type": r["type"], "content": content,
+                "project": r["project"] or "", "tags": tags,
+                "created_at": r["created_at"] or "",
+            }
+            if detail == "full":
+                entry.update({
+                    "context": r["context"] or "",
+                    "session_id": r["session_id"] or "",
+                    "status": r["status"] or "",
+                    "confidence": r["confidence"] if "confidence" in r.keys() else 1.0,
+                    "last_confirmed": r["last_confirmed"] or "",
+                    "recall_count": r["recall_count"] or 0,
+                    "branch": r["branch"] or "",
+                })
+            out.append(entry)
+        return J({"total": len(out), "detail": detail, "results": out})
 
     elif name == "memory_history":
         chain = store.get_version_history(a["id"])
@@ -3478,7 +3985,7 @@ async def _do(name, a):
             a.get("view", "full_report"), a.get("project"), a.get("days", 30)))
 
     elif name == "self_reflect":
-        rid, _, _ = store.save_knowledge(
+        rid, _, _, _ = store.save_knowledge(
             SID, a["reflection"], "reflection",
             a.get("project", "general"),
             (a.get("tags") or []) + ["self-reflection", a.get("outcome", "success")],
@@ -3488,7 +3995,10 @@ async def _do(name, a):
 
     elif name == "self_rules_context":
         return J(store.get_rules_for_context(
-            a.get("project", "general"), a.get("categories")))
+            a.get("project", "general"), a.get("categories"), a.get("phase")))
+
+    elif name == "rule_set_phase":
+        return J(store.set_rule_phase(a["rule_id"], a.get("phase")))
 
     elif name == "memory_observe":
         obs_id = store.save_observation(
@@ -3752,12 +4262,14 @@ async def _do(name, a):
         from session_continuity import SessionContinuity
         sc = SessionContinuity(store.db)
         return J(sc.session_end(
-            a["session_id"], a["summary"],
+            a["session_id"], a.get("summary"),
             highlights=a.get("highlights"),
             pitfalls=a.get("pitfalls"),
             next_steps=a.get("next_steps"),
             open_questions=a.get("open_questions"),
             project=a.get("project", "general"),
+            auto_compress=a.get("auto_compress", False),
+            transcript=a.get("transcript"),
         ))
 
     elif name == "ingest_codebase":
@@ -3808,6 +4320,80 @@ async def _do(name, a):
         h = EvalHarness(recall_fn=_recall_fn, file_warnings_fn=_warn_fn)
         report = h.run_suite(a.get("scenarios_path"))
         return J(report)
+
+    elif name in ("classify_task", "task_create", "phase_transition", "task_phases_list"):
+        from task_classifier import classify_task
+        from task_phases import TaskPhases
+        tp = TaskPhases(store.db)
+        return J({
+            "classify_task": lambda: classify_task(a["description"], a.get("project"), db=store.db),
+            "task_create": lambda: tp.create_task(a["task_id"], a["description"], level=a.get("level")),
+            "phase_transition": lambda: tp.phase_transition(a["task_id"], a["new_phase"], artifacts=a.get("artifacts"), notes=a.get("notes")),
+            "task_phases_list": lambda: {"phases": tp.list_phases(a["task_id"])},
+        }[name]())
+
+    elif name == "save_intent":
+        from intents import save_intent as _save_intent
+        db_path = str(MEMORY_DIR / "memory.db")
+        rid = _save_intent(
+            db_path,
+            a.get("prompt", ""),
+            a.get("session_id") or SID,
+            a.get("project"),
+        )
+        return J({"saved": bool(rid), "id": rid})
+
+    elif name == "list_intents":
+        from intents import list_intents as _list_intents
+        db_path = str(MEMORY_DIR / "memory.db")
+        rows = _list_intents(
+            db_path,
+            project=a.get("project"),
+            session_id=a.get("session_id"),
+            limit=int(a.get("limit", 50)),
+        )
+        return J({"items": rows, "count": len(rows)})
+
+    elif name == "search_intents":
+        from intents import search_intents as _search_intents
+        db_path = str(MEMORY_DIR / "memory.db")
+        rows = _search_intents(
+            db_path,
+            query=a.get("query", ""),
+            project=a.get("project"),
+            limit=int(a.get("limit", 20)),
+        )
+        return J({"items": rows, "count": len(rows)})
+
+    elif name == "save_decision":
+        from decisions import Decision, DecisionOption, save_decision
+        try:
+            options = [
+                DecisionOption(
+                    name=o["name"],
+                    pros=list(o.get("pros", []) or []),
+                    cons=list(o.get("cons", []) or []),
+                    unknowns=list(o.get("unknowns", []) or []),
+                )
+                for o in a["options"]
+            ]
+            decision = Decision(
+                title=a["title"],
+                options=options,
+                criteria_matrix=dict(a.get("criteria_matrix", {}) or {}),
+                selected=a["selected"],
+                rationale=a["rationale"],
+                discarded=list(a.get("discarded", []) or []),
+                project=a.get("project"),
+                tags=list(a.get("tags", []) or []),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return J({"saved": False, "error": f"invalid decision: {exc}"})
+
+        rid = save_decision(store, decision, session_id=SID)
+        if store.cache is not None:
+            store.cache.invalidate(project=decision.project)
+        return J({"saved": True, "id": rid, "structured": True})
 
     return J({"error": "Unknown tool"})
 

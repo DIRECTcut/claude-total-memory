@@ -135,6 +135,64 @@ def cleanup_old_markers():
             marker.unlink()
 
 
+def capture_tool_observation(
+    tool_name: str,
+    output: str,
+    session_id: str | None = None,
+    project: str | None = None,
+    queue_dir: Path | None = None,
+) -> Path | None:
+    """Enqueue one PostToolUse observation for deferred processing.
+
+    Writes a small JSON file into the extract-queue directory (same queue
+    the periodic auto-extractor drains). The caller — typically the
+    PostToolUse hook — is expected to be async and cheap; heavy work
+    (embedding, filtering, dedup) happens later when the queue is drained.
+
+    Returns the pending file Path, or None when nothing was enqueued
+    (empty output or tool_name).
+    """
+    if not tool_name or not output or not str(output).strip():
+        return None
+
+    qdir = Path(queue_dir) if queue_dir else EXTRACT_QUEUE
+    qdir.mkdir(parents=True, exist_ok=True)
+
+    lowered = output.lower()
+    error_markers = (
+        "traceback", "error:", "exception", "failed", "fatal",
+        "segmentation fault", "panic:", "non-zero exit",
+    )
+    is_error_candidate = any(m in lowered for m in error_markers)
+
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    sid = session_id or "unknown"
+    fname = f"pending-tool-obs-{sid}-{ts}.json"
+    fpath = qdir / fname
+
+    # Truncate oversized tool outputs (10KB is plenty for post-hoc analysis).
+    MAX_CHARS = 10_000
+    truncated = output if len(output) <= MAX_CHARS else output[:MAX_CHARS] + "\n... [truncated]"
+
+    payload = {
+        "kind": "tool_observation",
+        "tool_name": tool_name,
+        "session_id": sid,
+        "project": project or "unknown",
+        "output": truncated,
+        "tags": ["auto-capture", "post-tool-use", tool_name]
+                + (["error-candidate"] if is_error_candidate else []),
+        "error_candidate": is_error_candidate,
+        "captured_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+
+    try:
+        fpath.write_text(json.dumps(payload, ensure_ascii=False))
+        return fpath
+    except OSError:
+        return None
+
+
 def main():
     transcripts = find_active_transcripts()
 

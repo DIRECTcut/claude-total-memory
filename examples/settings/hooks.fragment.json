@@ -1,5 +1,6 @@
 {
-  "_comment": "Merge these entries into the top-level \"hooks\" object of ~/.claude/settings.json. If a key (e.g. PreToolUse) already exists, append the hook into its array instead of overwriting. Restart Claude Code after editing.",
+  "_comment": "Merge these entries into the top-level \"hooks\" object of ~/.claude/settings.json. If a key (e.g. PreToolUse) already exists, append the hook into its array instead of overwriting. Restart Claude Code after editing. install.sh auto-registers the same set — this fragment is for manual/partial setups.",
+  "_post_tool_use_note": "post-tool-use.sh is safe to register unconditionally: it's a no-op when MEMORY_POST_TOOL_CAPTURE is unset. Set MEMORY_POST_TOOL_CAPTURE=1 in your shell to enable deferred observation capture.",
   "hooks": {
     "SessionStart": [
       {
@@ -8,6 +9,39 @@
           {
             "type": "command",
             "command": "$HOME/.claude/hooks/session-start.sh"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/session-end.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/on-stop.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/user-prompt-submit.sh"
           }
         ]
       }
@@ -29,7 +63,29 @@
         "hooks": [
           {
             "type": "command",
+            "command": "$HOME/.claude/hooks/memory-trigger.sh"
+          },
+          {
+            "type": "command",
             "command": "$HOME/.claude/hooks/on-bash-error.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/auto-capture.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/post-tool-use.sh"
           }
         ]
       }

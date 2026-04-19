@@ -28,7 +28,7 @@ import sys
 import time
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -359,7 +359,7 @@ def reembed_all(db_path: str | Path = DB_PATH, model: str = "auto") -> dict[str,
     embedded = 0
     errors = 0
     dim = expected_dim
-    now = datetime.utcnow().isoformat() + "Z"
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     for i, record in enumerate(records):
         # Compose text to embed: content + context + tags

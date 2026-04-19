@@ -42,10 +42,10 @@ def test_expand_context_returns_graph_neighbors(store):
     store.db.commit()
 
     # Seed matching knowledge + a neighbor
-    seed_id, _, _ = store.save_knowledge(
+    seed_id, _, _, _ = store.save_knowledge(
         sid="s1", content="seed record about goexp queries", ktype="fact", project="demo"
     )
-    neighbor_id, _, _ = store.save_knowledge(
+    neighbor_id, _, _, _ = store.save_knowledge(
         sid="s1", content="another record about goexp patterns", ktype="fact", project="demo"
     )
 

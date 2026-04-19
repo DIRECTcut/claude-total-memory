@@ -17,7 +17,7 @@ from typing import Iterable
 
 
 VALID_REPRESENTATIONS: frozenset[str] = frozenset(
-    {"raw", "summary", "keywords", "questions", "compressed"}
+    {"raw", "summary", "keywords", "questions", "compressed", "criterion"}
 )
 
 

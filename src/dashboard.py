@@ -236,6 +236,191 @@ def api_sessions(db: sqlite3.Connection, limit: int = 20) -> list[dict]:
     return sessions
 
 
+def _knowledge_related(db: sqlite3.Connection, kid: int, limit: int = 10) -> list[dict]:
+    """Collect up to `limit` related knowledge records for citation.
+
+    Two sources are merged, preserving order and de-duplicating by id:
+      1. Direct knowledge<->knowledge edges in `graph_edges` where the node id
+         equals `k-{kid}` (convention used by the graph indexer) — 1-hop in
+         either direction.
+      2. Peer knowledge that shares a representation (same summary/keywords
+         cluster via `knowledge_representations`) — labelled "multi_repr".
+    """
+    out: list[dict] = []
+    seen: set[int] = {kid}
+
+    node_id = f"k-{kid}"
+    try:
+        edge_rows = db.execute(
+            """
+            SELECT target_id AS other, relation_type FROM graph_edges
+            WHERE source_id = ?
+            UNION
+            SELECT source_id AS other, relation_type FROM graph_edges
+            WHERE target_id = ?
+            LIMIT ?
+            """,
+            (node_id, node_id, limit * 4),
+        ).fetchall()
+    except sqlite3.Error:
+        edge_rows = []
+
+    for r in edge_rows:
+        other = r["other"] if isinstance(r, sqlite3.Row) else r[0]
+        if not other or not isinstance(other, str) or not other.startswith("k-"):
+            continue
+        try:
+            peer_id = int(other[2:])
+        except ValueError:
+            continue
+        if peer_id in seen:
+            continue
+        peer = q1(
+            db,
+            "SELECT id, type, substr(content, 1, 200) AS title "
+            "FROM knowledge WHERE id = ? AND status = 'active'",
+            (peer_id,),
+        )
+        if not peer:
+            continue
+        seen.add(peer_id)
+        out.append({"id": peer["id"], "title": peer["title"] or "", "via": "graph_edge"})
+        if len(out) >= limit:
+            return out
+
+    # Fallback / augmentation: peers sharing a representation.
+    try:
+        rep_rows = db.execute(
+            """
+            SELECT DISTINCT r2.knowledge_id AS peer_id
+            FROM knowledge_representations r1
+            JOIN knowledge_representations r2
+              ON r1.representation = r2.representation
+             AND r2.knowledge_id != r1.knowledge_id
+            WHERE r1.knowledge_id = ?
+            LIMIT ?
+            """,
+            (kid, limit * 2),
+        ).fetchall()
+    except sqlite3.Error:
+        rep_rows = []
+
+    for r in rep_rows:
+        peer_id = int(r["peer_id"] if isinstance(r, sqlite3.Row) else r[0])
+        if peer_id in seen:
+            continue
+        peer = q1(
+            db,
+            "SELECT id, type, substr(content, 1, 200) AS title "
+            "FROM knowledge WHERE id = ? AND status = 'active'",
+            (peer_id,),
+        )
+        if not peer:
+            continue
+        seen.add(peer_id)
+        out.append({"id": peer["id"], "title": peer["title"] or "", "via": "multi_repr"})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def api_knowledge_citation(db: sqlite3.Connection, kid: int) -> dict | None:
+    """Flat citation payload for /api/knowledge/{id} used by IDE integrations.
+
+    Shape is intentionally stable and self-contained — consumers paste the
+    URL into docs and expect the same keys every time.
+    """
+    record = q1(
+        db,
+        "SELECT id, type, content, context, project, tags, created_at, session_id "
+        "FROM knowledge WHERE id = ?",
+        (kid,),
+    )
+    if not record:
+        return None
+    tags = record.get("tags") or "[]"
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    record["tags"] = tags
+    record["related"] = _knowledge_related(db, kid, limit=10)
+    return record
+
+
+def api_session_citation(db: sqlite3.Connection, sid: str) -> dict | None:
+    """Citation payload for /api/session/{id}.
+
+    Merges the immutable `sessions` row (started_at, summary) with the latest
+    `session_summaries` continuity blob (which stores next_steps and
+    pitfalls). Knowledge linked to the session is attached as a light list.
+    """
+    session = q1(
+        db,
+        "SELECT id AS session_id, summary, started_at AS created_at, project, status "
+        "FROM sessions WHERE id = ?",
+        (sid,),
+    )
+
+    continuity = q1(
+        db,
+        "SELECT summary, next_steps, pitfalls, ended_at "
+        "FROM session_summaries WHERE session_id = ? "
+        "ORDER BY datetime(ended_at) DESC LIMIT 1",
+        (sid,),
+    )
+
+    # Either source being present means the session is citeable.
+    if not session and not continuity:
+        return None
+
+    def _decode_json_list(raw: object) -> list:
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, str):
+            try:
+                val = json.loads(raw)
+                return val if isinstance(val, list) else []
+            except Exception:
+                return []
+        return []
+
+    summary = ""
+    next_steps: list = []
+    pitfalls: list = []
+    created_at = ""
+    if continuity:
+        summary = continuity.get("summary") or ""
+        next_steps = _decode_json_list(continuity.get("next_steps"))
+        pitfalls = _decode_json_list(continuity.get("pitfalls"))
+        created_at = continuity.get("ended_at") or ""
+    if session:
+        if not summary:
+            summary = session.get("summary") or ""
+        if not created_at:
+            created_at = session.get("created_at") or ""
+
+    knowledge = q(
+        db,
+        "SELECT id, type, substr(content, 1, 160) AS title "
+        "FROM knowledge WHERE session_id = ? AND status = 'active' "
+        "ORDER BY id DESC LIMIT 100",
+        (sid,),
+    )
+
+    return {
+        "session_id": sid,
+        "summary": summary,
+        "next_steps": next_steps,
+        "pitfalls": pitfalls,
+        "knowledge": knowledge,
+        "created_at": created_at,
+    }
+
+
 def api_graph(db: sqlite3.Connection, limit: int = 1600) -> dict:
     """Nodes and edges for the graph visualization with auto-generated edges."""
     nodes = q(
@@ -3804,6 +3989,158 @@ loadGraph();
 """
 
 
+# ─────────────────────────────────────────────
+# Citation HTML views — /knowledge/{id}, /session/{id}
+# Both pages fetch the matching /api/... JSON in-browser and render it as
+# readable markdown-ish blocks. Kept intentionally simple (no framework).
+# ─────────────────────────────────────────────
+
+
+_KNOWLEDGE_VIEW_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Knowledge __KID__ — Claude Memory</title>
+<style>
+  body { margin:0; background:#0a0a14; color:#ddd;
+         font-family:-apple-system,Segoe UI,sans-serif; }
+  .wrap { max-width:860px; margin:40px auto; padding:0 20px; }
+  h1 { font-size:18px; color:#8ad; margin:0 0 4px; }
+  .meta { color:#888; font-size:12px; margin-bottom:20px; }
+  .meta b { color:#aaa; }
+  pre { background:#111; padding:14px; border:1px solid #222;
+        border-radius:6px; white-space:pre-wrap; font-size:13px;
+        line-height:1.5; color:#d0d0d0; }
+  .section { margin-top:24px; }
+  .section h2 { font-size:13px; color:#8ad; text-transform:uppercase;
+                letter-spacing:.05em; margin:0 0 8px; }
+  .tag { display:inline-block; background:#1a2a3a; color:#8ad;
+         padding:2px 8px; margin:2px; border-radius:12px; font-size:11px; }
+  .related a { color:#8ad; text-decoration:none; }
+  .related li { margin:6px 0; }
+  .via { color:#666; font-size:11px; margin-left:6px; }
+  .err { color:#f55; padding:20px; }
+  a.back { color:#888; font-size:12px; text-decoration:none; }
+  a.back:hover { color:#8ad; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a href="/" class="back">← Dashboard</a>
+  <div id="body"><p style="color:#888">Loading knowledge __KID__…</p></div>
+</div>
+<script>
+const KID = "__KID__";
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+fetch("/api/knowledge/" + KID)
+  .then(r => r.json().then(j => ({ok: r.ok, data: j})))
+  .then(({ok, data}) => {
+    const b = document.getElementById("body");
+    if (!ok) {
+      b.innerHTML = '<div class="err">Error: ' + esc(data.message || data.error) + '</div>';
+      return;
+    }
+    const tags = (data.tags || []).map(t =>
+      '<span class="tag">' + esc(t) + '</span>').join("");
+    const related = (data.related || []).map(r =>
+      '<li class="related"><a href="/knowledge/' + r.id + '">#' + r.id +
+      ' ' + esc(r.title) + '</a><span class="via">via ' + esc(r.via) + '</span></li>'
+    ).join("") || '<li style="color:#666">No related records</li>';
+    b.innerHTML =
+      '<h1>Knowledge #' + esc(data.id) + ' — ' + esc(data.type) + '</h1>' +
+      '<div class="meta">' +
+        '<b>Project:</b> ' + esc(data.project || "–") + ' · ' +
+        '<b>Session:</b> ' + esc(data.session_id || "–") + ' · ' +
+        '<b>Created:</b> ' + esc(data.created_at || "–") +
+      '</div>' +
+      '<div class="section"><h2>Content</h2><pre>' + esc(data.content) + '</pre></div>' +
+      (data.context ? '<div class="section"><h2>Context</h2><pre>' +
+        esc(data.context) + '</pre></div>' : "") +
+      (tags ? '<div class="section"><h2>Tags</h2>' + tags + '</div>' : "") +
+      '<div class="section"><h2>Related</h2><ul>' + related + '</ul></div>';
+  })
+  .catch(e => {
+    document.getElementById("body").innerHTML =
+      '<div class="err">Fetch failed: ' + esc(e.message) + '</div>';
+  });
+</script>
+</body>
+</html>
+"""
+
+
+_SESSION_VIEW_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Session __SID__ — Claude Memory</title>
+<style>
+  body { margin:0; background:#0a0a14; color:#ddd;
+         font-family:-apple-system,Segoe UI,sans-serif; }
+  .wrap { max-width:860px; margin:40px auto; padding:0 20px; }
+  h1 { font-size:18px; color:#8ad; margin:0 0 4px; }
+  .meta { color:#888; font-size:12px; margin-bottom:20px; }
+  pre { background:#111; padding:14px; border:1px solid #222;
+        border-radius:6px; white-space:pre-wrap; font-size:13px;
+        line-height:1.5; color:#d0d0d0; }
+  .section { margin-top:24px; }
+  .section h2 { font-size:13px; color:#8ad; text-transform:uppercase;
+                letter-spacing:.05em; margin:0 0 8px; }
+  li { margin:4px 0; color:#ccc; }
+  .k-link { color:#8ad; text-decoration:none; }
+  .k-link:hover { text-decoration:underline; }
+  .err { color:#f55; padding:20px; }
+  a.back { color:#888; font-size:12px; text-decoration:none; }
+  a.back:hover { color:#8ad; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a href="/" class="back">← Dashboard</a>
+  <div id="body"><p style="color:#888">Loading session…</p></div>
+</div>
+<script>
+const SID = "__SID__";
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+fetch("/api/session/" + encodeURIComponent(SID))
+  .then(r => r.json().then(j => ({ok: r.ok, data: j})))
+  .then(({ok, data}) => {
+    const b = document.getElementById("body");
+    if (!ok) {
+      b.innerHTML = '<div class="err">Error: ' + esc(data.message || data.error) + '</div>';
+      return;
+    }
+    const list = arr => (arr && arr.length)
+      ? '<ul>' + arr.map(x => '<li>' + esc(x) + '</li>').join("") + '</ul>'
+      : '<p style="color:#666">–</p>';
+    const know = (data.knowledge || []).map(k =>
+      '<li><a class="k-link" href="/knowledge/' + k.id + '">#' + k.id + ' ' +
+      esc(k.type) + '</a> — ' + esc(k.title) + '</li>').join("")
+      || '<li style="color:#666">No knowledge linked</li>';
+    b.innerHTML =
+      '<h1>Session ' + esc(data.session_id) + '</h1>' +
+      '<div class="meta"><b>Created:</b> ' + esc(data.created_at || "–") + '</div>' +
+      '<div class="section"><h2>Summary</h2><pre>' + esc(data.summary || "") + '</pre></div>' +
+      '<div class="section"><h2>Next steps</h2>' + list(data.next_steps) + '</div>' +
+      '<div class="section"><h2>Pitfalls</h2>' + list(data.pitfalls) + '</div>' +
+      '<div class="section"><h2>Knowledge</h2><ul>' + know + '</ul></div>';
+  })
+  .catch(e => {
+    document.getElementById("body").innerHTML =
+      '<div class="err">Fetch failed: ' + esc(e.message) + '</div>';
+  });
+</script>
+</body>
+</html>
+"""
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the memory dashboard."""
 
@@ -3840,6 +4177,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _send_error(self, status: int, message: str) -> None:
         """Send an error JSON response."""
         self._send_json({"error": message}, status)
+
+    def _send_error_citation(self, status: int, code: str, message: str) -> None:
+        """Citation-API error: {"error": "<code>", "message": "<details>"}.
+
+        Used by the /api/knowledge/{id} and /api/session/{id} endpoints to
+        give IDE integrations a stable machine-parseable error shape.
+        """
+        self._send_json({"error": code, "message": message}, status)
 
     def _get_db(self) -> sqlite3.Connection | None:
         """Open a read-only DB connection. Returns None if DB is missing."""
@@ -3978,6 +4323,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_error(500, f"graph matrix error: {e}")
             return
 
+        # --- Citation HTML view for /knowledge/{id} ---
+        # Renders a minimal dark-theme page that consumes the same JSON as
+        # /api/knowledge/{id}. Used when pasting a URL into docs / chat.
+        if path.startswith("/knowledge/"):
+            parts = path.split("/")
+            if len(parts) == 3 and parts[2].isdigit():
+                self._send_html(_KNOWLEDGE_VIEW_HTML.replace("__KID__", parts[2]))
+                return
+            self._send_error(404, "not_found")
+            return
+
+        # --- Citation HTML view for /session/{id} ---
+        if path.startswith("/session/"):
+            parts = path.split("/")
+            if len(parts) == 3 and parts[2]:
+                sid_html = parts[2].replace('"', "").replace("<", "").replace(">", "")
+                self._send_html(_SESSION_VIEW_HTML.replace("__SID__", sid_html))
+                return
+            self._send_error(404, "not_found")
+            return
+
         # --- System status (no DB required) ---
         if path == "/status":
             self._send_json(api_system_status())
@@ -4040,17 +4406,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(api_knowledge(db, search, ktype, project, page, limit))
 
             elif path.startswith("/api/knowledge/"):
-                # Extract ID from path
+                # Extract ID from path — citation API: stable JSON shape with
+                # related edges / multi-repr peers for IDE linking.
                 parts = path.split("/")
                 if len(parts) == 4 and parts[3].isdigit():
                     kid = int(parts[3])
-                    result = api_knowledge_detail(db, kid)
+                    result = api_knowledge_citation(db, kid)
                     if result:
                         self._send_json(result)
                     else:
-                        self._send_error(404, "Knowledge record not found")
+                        self._send_error_citation(
+                            404, "not_found",
+                            f"knowledge record {kid} not found",
+                        )
                 else:
-                    self._send_error(400, "Invalid knowledge ID")
+                    self._send_error_citation(
+                        400, "bad_request", "invalid knowledge id",
+                    )
+
+            elif path.startswith("/api/session/") and path != "/api/sessions":
+                # /api/session/{id} — citation payload (summary + next_steps + pitfalls)
+                parts = path.split("/")
+                if len(parts) == 4 and parts[3]:
+                    from urllib.parse import unquote
+                    sid = unquote(parts[3])
+                    result = api_session_citation(db, sid)
+                    if result:
+                        self._send_json(result)
+                    else:
+                        self._send_error_citation(
+                            404, "not_found",
+                            f"session {sid} not found",
+                        )
+                else:
+                    self._send_error_citation(
+                        400, "bad_request", "invalid session id",
+                    )
 
             elif path == "/api/sessions":
                 limit = min(200, max(1, int(p("limit", "20"))))

@@ -43,7 +43,7 @@ def test_memory_save_enqueues_for_triple_extraction(store):
     )
     store.db.commit()
 
-    rid, _dup, _red = store.save_knowledge(
+    rid, _dup, _red, _priv = store.save_knowledge(
         sid=sid,
         content="User prefers Go for backend services built with gRPC.",
         ktype="fact",
@@ -80,7 +80,7 @@ def test_memory_save_survives_queue_failure(store, monkeypatch):
     )
     store.db.commit()
 
-    rid, _, _ = store.save_knowledge(
+    rid, _, _, _ = store.save_knowledge(
         sid=sid, content="any content for testing", ktype="fact", project="demo"
     )
     assert rid  # save succeeded despite queue crash

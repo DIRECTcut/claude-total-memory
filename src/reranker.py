@@ -51,7 +51,9 @@ def _ollama_generate(prompt: str, model: str, max_tokens: int = 200, temperature
 
 
 def _ollama_embed(text: str, model: str = None) -> Optional[list]:
-    """Get embedding via Ollama."""
+    """Get embedding via Ollama. Retained for backward compat; new code
+    should use _provider_embed() which dispatches to the configured
+    EmbeddingProvider (fastembed|openai|cohere)."""
     model = model or OLLAMA_EMBED_MODEL
     try:
         payload = json.dumps({"model": model, "prompt": text}).encode()
@@ -67,6 +69,40 @@ def _ollama_embed(text: str, model: str = None) -> Optional[list]:
     except Exception as e:
         LOG(f"embed error: {e}")
         return None
+
+
+# Module-level cache for the configured provider. Rebuilt on first call;
+# tests that mutate MEMORY_EMBED_PROVIDER between invocations should call
+# _reset_embed_provider() (e.g. via monkeypatch with raising=False).
+_embed_provider_cache = None
+
+
+def _reset_embed_provider() -> None:
+    """Clear the cached embed provider — used by tests after env changes."""
+    global _embed_provider_cache
+    _embed_provider_cache = None
+
+
+def _provider_embed(text: str) -> Optional[list]:
+    """Embed a single text via the configured EmbeddingProvider.
+
+    Falls back to the legacy Ollama path only if the provider init or
+    call fails — this way the default MEMORY_EMBED_PROVIDER=fastembed
+    keeps working locally while OpenAI/Cohere routes go through HTTP.
+    """
+    global _embed_provider_cache
+    try:
+        if _embed_provider_cache is None:
+            import config as _cfg
+            from embed_provider import make_embed_provider
+            _embed_provider_cache = make_embed_provider(_cfg.get_embed_provider())
+        vecs = _embed_provider_cache.embed([text])
+        if vecs:
+            return list(vecs[0])
+    except Exception as e:  # noqa: BLE001
+        LOG(f"provider embed error: {e}")
+    # Last-ditch fallback — keeps HyDE working when no provider reachable.
+    return _ollama_embed(text)
 
 
 # =============================================================================
@@ -103,7 +139,7 @@ Answer:"""
         return None
 
     # Embed the hypothetical answer (not the original query)
-    embedding = _ollama_embed(hypothetical)
+    embedding = _provider_embed(hypothetical)
     return embedding
 
 

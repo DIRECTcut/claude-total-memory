@@ -68,11 +68,26 @@ class TripleExtractionQueue:
     # Claim / finalize
     # ──────────────────────────────────────────────
 
+    def reclaim_stale(self, stale_minutes: int = 30) -> int:
+        # Delete stuck processing rows older than N minutes. Without this,
+        # a crashed worker leaves a processing row that blocks new pending
+        # rows for the same knowledge_id via UNIQUE(knowledge_id, status).
+        cur = self.db.execute(
+            "DELETE FROM triple_extraction_queue "
+            "WHERE status = 'processing' "
+            "AND claimed_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)",
+            (f"-{int(stale_minutes)} minutes",),
+        )
+        self.db.commit()
+        return cur.rowcount or 0
+
     def claim_next(self) -> dict | None:
         """Atomically mark the oldest pending row as processing and return it.
 
         Returns dict with id, knowledge_id, attempts. None if no pending work.
         """
+        # Unblock queue if previous worker crashed mid-flight.
+        self.reclaim_stale()
         # SQLite lacks native SKIP LOCKED, but this process is single-threaded
         # per queue instance; reflection.agent runs sequentially.
         row = self.db.execute(

@@ -9,6 +9,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_active_context_vault(tmp_path_factory, monkeypatch):
+    """Redirect activeContext.md writes into a per-test tmp dir.
+
+    Prevents the session_continuity markdown projection from writing into the
+    real ~/Documents vault during test runs. Tests that care about the vault
+    path override the env var themselves.
+    """
+    if "MEMORY_ACTIVECONTEXT_VAULT" not in __import__("os").environ:
+        safe = tmp_path_factory.mktemp("active_ctx_vault")
+        monkeypatch.setenv("MEMORY_ACTIVECONTEXT_VAULT", str(safe))
+    yield
+
+
 @pytest.fixture
 def db():
     """In-memory SQLite database with all v5 tables."""

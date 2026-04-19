@@ -40,7 +40,7 @@ def test_save_works_without_llm(store):
         "INSERT INTO sessions (id, started_at, project, status) VALUES ('s1', '2026-04-14T00:00:00Z', 'demo', 'open')"
     )
     store.db.commit()
-    rid, dup, _ = store.save_knowledge(
+    rid, dup, _, _ = store.save_knowledge(
         sid="s1", content="hello world", ktype="fact", project="demo"
     )
     assert rid
@@ -74,7 +74,7 @@ def test_reflection_drain_skips_llm_phases(store):
         "INSERT INTO sessions (id, started_at, project, status) VALUES ('s1', '2026-04-14T00:00:00Z', 'demo', 'open')"
     )
     store.db.commit()
-    rid, _, _ = store.save_knowledge(
+    rid, _, _, _ = store.save_knowledge(
         sid="s1", content="some content here for processing", ktype="fact", project="demo"
     )
 

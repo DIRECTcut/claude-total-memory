@@ -35,7 +35,7 @@ def test_save_enqueues_representations(store):
         "INSERT INTO sessions (id, started_at, project, status) VALUES ('s1', '2026-04-14T00:00:00Z', 'demo', 'open')"
     )
     store.db.commit()
-    rid, _, _ = store.save_knowledge(
+    rid, _, _, _ = store.save_knowledge(
         sid="s1", content="content", ktype="fact", project="demo"
     )
 
@@ -63,7 +63,7 @@ def test_reflection_generates_representations(store, monkeypatch):
         "and safe database migrations with concurrent index creation. "
         "Additional sections discuss auth via JWT, rate limiting, and caching."
     )
-    rid, _, _ = store.save_knowledge(
+    rid, _, _, _ = store.save_knowledge(
         sid="s1", content=long_content, ktype="fact", project="demo"
     )
 

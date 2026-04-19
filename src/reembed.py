@@ -24,7 +24,7 @@ import struct
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -229,7 +229,7 @@ def main():
     # Upsert
     upsert_start = time.time()
     upserted = 0
-    now = datetime.utcnow().isoformat() + "Z"
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     for i in range(0, len(records), args.batch_size):
         batch_records = records[i : i + args.batch_size]

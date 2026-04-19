@@ -1,0 +1,20 @@
+{
+  "_comment": "Claude Code on Windows host -> MCP server inside WSL2. Replace USERNAME with your WSL username (run `wsl -- whoami` from PowerShell). Merge mcpServers.memory into %USERPROFILE%\\.claude\\settings.json. If Claude Code runs INSIDE WSL (e.g. via VS Code Remote-WSL), do NOT use this file -- use the regular Linux settings with a plain `.venv/bin/python` command.",
+  "_placeholder": "USERNAME",
+  "_how_to_substitute_powershell": "(Get-Content examples\\settings\\claude-code-wsl.json) -replace 'USERNAME', (wsl -- whoami).Trim() | Set-Content $env:USERPROFILE\\.claude\\settings.json.new",
+  "mcpServers": {
+    "memory": {
+      "command": "wsl",
+      "args": [
+        "-e",
+        "/home/USERNAME/claude-memory-server/.venv/bin/python",
+        "/home/USERNAME/claude-memory-server/src/server.py"
+      ],
+      "env": {
+        "CLAUDE_MEMORY_DIR": "/home/USERNAME/.claude-memory",
+        "MEMORY_LLM_MODEL": "qwen2.5-coder:7b",
+        "OLLAMA_HOST": "http://127.0.0.1:11434"
+      }
+    }
+  }
+}

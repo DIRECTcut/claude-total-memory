@@ -165,7 +165,7 @@ class ReflectionAgent:
         """
         try:
             from config import has_llm
-            if not has_llm():
+            if not has_llm("triple"):
                 LOG("triple extraction skipped: LLM unavailable")
                 return {"processed": 0, "failed": 0, "skipped": 0, "deferred": "no_llm"}
         except Exception:
@@ -325,7 +325,7 @@ class ReflectionAgent:
         """
         try:
             from config import has_llm
-            if not has_llm():
+            if not has_llm("enrich"):
                 LOG("deep enrichment skipped: LLM unavailable")
                 return {"processed": 0, "failed": 0, "skipped": 0, "deferred": "no_llm"}
         except Exception:
@@ -346,7 +346,14 @@ class ReflectionAgent:
             return {"processed": 0, "failed": 0, "skipped": 0, "error": str(e)}
 
     def _make_llm_merge_fn(self):
-        """Build an Ollama-backed merger. Returns None if Ollama unreachable."""
+        """Build a provider-backed merger. Returns None if LLM unreachable.
+
+        Uses the `llm_provider` abstraction: Ollama by default, OpenAI /
+        Anthropic / any OpenAI-compatible endpoint when configured via
+        MEMORY_LLM_PROVIDER. On provider/network errors during a merge the
+        closure degrades to an empty string (FactMerger's validator rejects
+        empty merges, so we simply skip the cluster).
+        """
         # Don't even build the closure if no LLM configured
         try:
             from config import has_llm
@@ -355,8 +362,8 @@ class ReflectionAgent:
         except Exception:
             pass
 
-        import json as _json
-        import urllib.request as _req
+        import config as _config
+        import urllib.error as _urlerr
 
         prompt_tmpl = (
             "You are consolidating related facts into ONE concise sentence.\n"
@@ -365,25 +372,34 @@ class ReflectionAgent:
             "SOURCES:\n{sources}\n\nMERGED:"
         )
 
-        import os as _os
-        model_name = _os.environ.get("MEMORY_LLM_MODEL", "qwen2.5-coder:7b")
+        # Build provider once; reuse across cluster merges in this run.
+        try:
+            from llm_provider import make_provider
+            provider = make_provider(_config.get_llm_provider())
+        except Exception as exc:  # noqa: BLE001 — bad provider name etc.
+            LOG(f"fact_merger provider init failed: {exc}")
+            return None
+        if not provider.available():
+            LOG(f"fact_merger provider '{getattr(provider, 'name', '?')}' unavailable")
+            return None
+
+        model_name = _config.get_llm_model_for_provider(_config.get_llm_provider())
+        timeout = 60.0
 
         def merge(contents: list[str]) -> str:
             sources = "\n\n---\n\n".join(f"- {c}" for c in contents)
-            payload = {
-                "model": model_name,
-                "prompt": prompt_tmpl.format(sources=sources),
-                "stream": False,
-                "options": {"num_predict": 200, "temperature": 0.1},
-            }
-            req = _req.Request(
-                "http://localhost:11434/api/generate",
-                data=_json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-            )
-            with _req.urlopen(req, timeout=60) as resp:
-                data = _json.loads(resp.read())
-            return str(data.get("response", "")).strip()
+            prompt = prompt_tmpl.format(sources=sources)
+            try:
+                return provider.complete(
+                    prompt,
+                    model=model_name,
+                    max_tokens=200,
+                    temperature=0.1,
+                    timeout=timeout,
+                )
+            except (_urlerr.URLError, RuntimeError, OSError) as exc:
+                sys.stderr.write(f"[memory-reflection] LLM merge error: {exc}\n")
+                return ""
 
         return merge
 

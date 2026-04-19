@@ -43,7 +43,7 @@ def test_rerank_includes_multi_repr_hits(store, monkeypatch):
         "delivery, and high-availability patterns. Consumers use manual ack "
         "with prefetch tuning for optimal throughput and back-pressure handling."
     )
-    rid, _, _ = store.save_knowledge(
+    rid, _, _, _ = store.save_knowledge(
         sid="s1", content=long_content, ktype="solution", project="demo"
     )
 

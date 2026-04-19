@@ -26,7 +26,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -114,7 +114,7 @@ class FileProcessor:
         if not content.strip():
             return
 
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         db.execute(
             "INSERT INTO knowledge (session_id, type, content, context, project, tags, created_at) "
             "VALUES (?, 'fact', ?, ?, 'general', ?, ?)",
@@ -137,7 +137,7 @@ class FileProcessor:
             return
 
         lang = file_path.suffix.lstrip(".")
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         db.execute(
             "INSERT INTO knowledge (session_id, type, content, context, project, tags, created_at) "
             "VALUES (?, 'solution', ?, ?, 'general', ?, ?)",
@@ -164,7 +164,7 @@ class FileProcessor:
             pass
 
         content = ocr_text if ocr_text else f"Image: {file_path.name}"
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         db.execute(
             "INSERT INTO knowledge (session_id, type, content, context, project, tags, created_at) "
             "VALUES (?, 'fact', ?, ?, 'general', ?, ?)",
@@ -197,7 +197,7 @@ class FileProcessor:
         except Exception as e:
             LOG(f"PDF extraction error: {e}")
 
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         db.execute(
             "INSERT INTO knowledge (session_id, type, content, context, project, tags, created_at) "
             "VALUES (?, 'fact', ?, ?, 'general', ?, ?)",
