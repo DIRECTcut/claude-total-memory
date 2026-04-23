@@ -1712,7 +1712,7 @@ class Recall:
             pass
 
         # ── Tier 2: Semantic search (binary quantization or ChromaDB fallback) ──
-        can_embed = self.s.fastembed or self.s.embedder or self.s._check_ollama()
+        can_embed = self.s._embed_mode != "none"
         semantic_tier = []   # (doc_id, score) for RRF
         hyde_tier = []       # (doc_id, score) for RRF
         if self.s._check_binary_search() and can_embed:
