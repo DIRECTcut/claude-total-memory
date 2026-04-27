@@ -1,0 +1,435 @@
+# IDE setup guide — total-agent-memory v10.5
+
+Same MCP server, same tools, same protocol — different installation
+locations and hook wiring per IDE. The installer
+(`install.sh --ide <name>`) automates all of this; this document is
+both the manual fallback and the reference for what the installer
+does.
+
+If your IDE is not listed: contributions welcome. The protocol still
+works as long as the client speaks MCP — just paste the SKILL.md
+content into your system-prompt or rules file.
+
+---
+
+## Universal preconditions
+
+```
+- Python 3.10+ (3.13 recommended)
+- One of: Ollama (local LLM, recommended) or any cloud provider
+  (OpenAI / Anthropic / Cohere / OpenAI-compat)
+- ~/claude-memory-server checked out (or installed via package)
+- ~/.claude-memory/ writable for SQLite + cache + wikis
+```
+
+```bash
+# Verify the MCP server starts in stdio mode:
+python3 -m claude_total_memory.cli verify
+```
+
+---
+
+## 1. Claude Code (CLI + desktop)
+
+**Hook API:** ✅ full
+**Skill API:** ✅ via `~/.claude/skills/<name>/SKILL.md`
+**Sub-agents:** ✅ via `~/.claude/agents/<name>.md`
+
+### Install
+
+```bash
+~/claude-memory-server/install.sh --ide claude-code
+```
+
+The installer writes:
+
+- `~/.claude/skills/memory-protocol/` (this skill, with `references/`)
+- `~/.claude/settings.json` — adds the MCP server entry + 5 hooks
+- `~/.claude/CLAUDE.md` — appends `@~/.claude/rules/memory.md` reference
+
+### Manual
+
+`~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "python3",
+      "args": ["-m", "claude_total_memory.cli", "serve", "--mode", "stdio"]
+    }
+  },
+  "hooks": {
+    "SessionStart":    [{"matcher": ".*", "hooks": [{"type": "command", "command": "~/.claude/hooks/session-start.sh"}]}],
+    "PreToolUse":      [{"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "~/.claude/hooks/pre-edit.sh"}]}],
+    "UserPromptSubmit":[{"matcher": ".*", "hooks": [{"type": "command", "command": "~/.claude/hooks/user-prompt-submit.sh"}]}],
+    "Stop":            [{"matcher": ".*", "hooks": [{"type": "command", "command": "~/.claude/hooks/on-stop.sh"}]}],
+    "PostToolUse":     [{"matcher": ".*", "hooks": [{"type": "command", "command": "~/.claude/hooks/post-tool-use.sh"}]}]
+  }
+}
+```
+
+Restart `claude` and run `/skills` to confirm `memory-protocol` is
+listed.
+
+---
+
+## 2. Codex CLI
+
+**Hook API:** ✅ via `[hooks]` in TOML
+**Skill API:** custom — load via `AGENTS.md` reference
+**Sub-agents:** N/A
+
+### Install
+
+```bash
+~/claude-memory-server/install.sh --ide codex
+```
+
+Writes:
+
+- `~/.codex/skills/memory-protocol/` (mirror of the Claude Code skill)
+- `~/.codex/config.toml` — adds MCP server + hook entries
+- `~/.codex/AGENTS.md` — appends a `## Memory protocol` section
+  (compact version of SKILL.md)
+
+### Manual `~/.codex/config.toml`:
+
+```toml
+[mcp.servers.memory]
+command = "python3"
+args = ["-m", "claude_total_memory.cli", "serve", "--mode", "stdio"]
+
+[hooks]
+SessionStart    = "~/.codex/hooks/session-start.sh"
+PreToolUse      = "~/.codex/hooks/pre-edit.sh"
+UserPromptSubmit = "~/.codex/hooks/user-prompt-submit.sh"
+Stop            = "~/.codex/hooks/on-stop.sh"
+BashErrorHook   = "~/.codex/hooks/on-bash-error.sh"
+```
+
+`~/.codex/AGENTS.md`: append the `## Memory protocol` block — a
+distilled version is in `templates/codex-AGENTS-block.md`.
+
+---
+
+## 3. Cursor
+
+**Hook API:** ❌
+**Skill API:** Rules pane (project + global)
+**Sub-agents:** Composer custom commands
+
+### Install
+
+```bash
+~/claude-memory-server/install.sh --ide cursor
+```
+
+Writes:
+
+- `<project>/.cursor/rules/memory-protocol.mdc` — the canonical rules
+  file Cursor auto-loads with `description:` and `globs:` set so it
+  triggers on every file
+- `~/.cursor/mcp.json` — MCP server registration (Cursor reads this)
+
+### Manual
+
+`<project>/.cursor/rules/memory-protocol.mdc`:
+
+```mdc
+---
+description: total-agent-memory protocol — recall before tasks, save after
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# (paste the body of SKILL.md here, dropping the YAML frontmatter)
+```
+
+`~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "python3",
+      "args": ["-m", "claude_total_memory.cli", "serve", "--mode", "stdio"]
+    }
+  }
+}
+```
+
+Cursor doesn't fire IDE hooks. The protocol relies on the rules
+content telling the model to call `session_init` on first turn and
+`memory_recall` before tasks. Recovery files from `on-stop` are
+loaded manually with `/recall` style commands.
+
+---
+
+## 4. Cline (VS Code extension)
+
+**Hook API:** ❌
+**Skill API:** `.clinerules/` directory
+**Sub-agents:** N/A
+
+### Install
+
+```bash
+~/claude-memory-server/install.sh --ide cline
+```
+
+Writes:
+
+- `<project>/.clinerules/memory-protocol.md` — auto-loaded by Cline
+- VS Code `settings.json` — adds the MCP server under
+  `cline.mcpServers`
+
+### Manual
+
+`<project>/.clinerules/memory-protocol.md`:
+
+```markdown
+# (paste SKILL.md body here)
+```
+
+VS Code → settings.json:
+
+```json
+{
+  "cline.mcpServers": {
+    "memory": {
+      "command": "python3",
+      "args": ["-m", "claude_total_memory.cli", "serve", "--mode", "stdio"]
+    }
+  }
+}
+```
+
+---
+
+## 5. Continue (VS Code / JetBrains)
+
+**Hook API:** ❌
+**Skill API:** `~/.continue/config.json` rules
+**Sub-agents:** N/A
+
+### Install
+
+```bash
+~/claude-memory-server/install.sh --ide continue
+```
+
+Writes:
+
+- `~/.continue/rules/memory-protocol.md`
+- `~/.continue/config.json` — adds `mcpServers.memory` entry and
+  `systemMessage` referencing the rules file
+
+### Manual
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "python3",
+      "args": ["-m", "claude_total_memory.cli", "serve", "--mode", "stdio"]
+    }
+  },
+  "systemMessage": "Follow the rules in ~/.continue/rules/memory-protocol.md.",
+  "rules": [
+    {"file": "~/.continue/rules/memory-protocol.md"}
+  ]
+}
+```
+
+---
+
+## 6. Aider
+
+**Hook API:** ❌
+**Skill API:** `--read` files / `.aider.conf.yml`
+**Sub-agents:** N/A
+
+Aider has no MCP support yet (as of writing). Memory access is via
+the bash bridge:
+
+```yaml
+# .aider.conf.yml
+read:
+  - ~/claude-memory-server/skills/memory-protocol/SKILL.md
+```
+
+In the prompt, instruct Aider to shell out:
+
+```
+For any past convention, run:
+  ~/claude-memory-server/ollama/lookup_memory.sh "<query>"
+
+For saving:
+  ~/claude-memory-server/ollama/save_memory.sh --type solution \
+      --project <name> --tags "reusable,..." --content "..."
+```
+
+---
+
+## 7. Windsurf
+
+**Hook API:** ❌ (planned per docs)
+**Skill API:** `.windsurfrules`
+**Sub-agents:** Cascade flows
+
+### Install
+
+```bash
+~/claude-memory-server/install.sh --ide windsurf
+```
+
+Writes:
+
+- `<project>/.windsurfrules` — paste of SKILL.md body
+- `~/.windsurf/mcp_config.json` — MCP server entry
+
+---
+
+## 8. Gemini CLI
+
+**Hook API:** ⚠️ partial
+**Skill API:** `.gemini/rules/`
+**Sub-agents:** N/A
+
+### Install
+
+```bash
+~/claude-memory-server/install.sh --ide gemini-cli
+```
+
+Writes:
+
+- `~/.gemini/rules/memory-protocol.md`
+- `~/.gemini/config.toml` — MCP server registration
+
+---
+
+## 9. OpenCode
+
+**Hook API:** ✅ via `.opencode/hooks/<event>.json`
+**Skill API:** `.opencode/skills/`
+**Sub-agents:** custom commands
+
+### Install
+
+```bash
+~/claude-memory-server/install.sh --ide opencode
+```
+
+Writes:
+
+- `~/.opencode/skills/memory-protocol/` (mirror of Claude Code skill)
+- `~/.opencode/config.toml` — MCP + hooks
+- `~/.opencode/hooks/session-start.json`, `pre-edit.json`, etc.
+
+OpenCode's hook API is JSON-event based; the bash hooks are wrapped
+by a small JSON adapter the installer writes.
+
+---
+
+## Cross-platform notes
+
+### Windows (native)
+
+Use the PowerShell variants:
+
+```powershell
+~\claude-memory-server\install.ps1 -Ide claude-code
+```
+
+The `.ps1` hooks read PowerShell-formatted JSON from stdin. Same
+behaviour as the bash variants.
+
+### WSL2 (Ubuntu / Debian / Alpine)
+
+Same as Linux — use `install.sh --ide <name>`. The installer detects
+WSL2 and adjusts:
+
+- `~/.claude/` paths use the Linux home, not the Windows one
+- Bash `<( ... )` process substitution is avoided (some `dash`
+  fallbacks)
+- Ollama URL defaults to `http://localhost:11434` inside WSL2 but
+  can be flipped to `http://host.docker.internal:11434` if Ollama
+  runs on Windows
+
+### macOS (Apple Silicon and Intel)
+
+Default. The installer uses bash 3.2 (macOS default) syntax — no
+`mapfile`, no `[[`-pcre, no `${VAR^^}` (uppercase). All hooks run
+under `/bin/bash` (3.2.x) without the Homebrew bash 5.
+
+### macOS bash 3.2 quirks worth knowing
+
+- No `mapfile` / `readarray` — use `while IFS= read -r line; do ... done`.
+- `case` with `;;&` falls through; `;;` is the safe default.
+- `${var,,}` lowercase doesn't exist — use `tr '[:upper:]' '[:lower:]'`.
+- `local -n` namerefs don't exist — use eval-via-printf if you must.
+
+The installer guards every script with `set -eu` (no `-o pipefail` —
+it's not in POSIX sh and breaks on dash; explicit pipe-error checks
+are used instead).
+
+---
+
+## Verification
+
+After install, verify in three places:
+
+```bash
+# 1. MCP server reachable
+python3 -m claude_total_memory.cli verify
+
+# 2. Skill loaded by IDE
+# (Claude Code) /skills | grep memory-protocol
+# (Codex)       codex skills list | grep memory
+# (Cursor)      Settings → Rules → check memory-protocol.mdc enabled
+# (Cline)       reload window, prompt: "what skills are loaded?"
+
+# 3. Hooks firing (where supported)
+tail -f ~/.claude-memory/hooks.log
+# … then trigger a session start in your IDE; expect a session-start log line
+```
+
+If any step fails, the installer's `--diagnose` flag prints a
+detailed health report:
+
+```bash
+~/claude-memory-server/install.sh --diagnose
+```
+
+---
+
+## Removing / switching IDE
+
+```bash
+~/claude-memory-server/install.sh --uninstall --ide <name>
+```
+
+Removes only that IDE's wiring; the MCP server, DB, and skill files
+remain. To wipe everything:
+
+```bash
+~/claude-memory-server/install.sh --uninstall --all
+# … and optionally:
+rm -rf ~/.claude-memory/
+```
+
+---
+
+## "Bring your own MCP client" — minimal protocol
+
+If your client speaks MCP but isn't on this list:
+
+1. Register the server: command `python3 -m claude_total_memory.cli serve --mode stdio`.
+2. In your system prompt, paste the body of
+   `skills/memory-protocol/SKILL.md` (drop the YAML frontmatter).
+3. Memorise: **`session_init` first, `memory_recall` before tasks,
+   `memory_save` after, `session_end` last.**
+
+That's the whole skill in one paragraph.

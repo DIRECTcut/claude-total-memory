@@ -45,7 +45,7 @@ test_c.py::test_5 PASSED
 """ * 5
 
     original_len = len(noisy)
-    rid, _, _, _ = store.save_knowledge(
+    rid, *_save = store.save_knowledge(
         sid="s1", content=noisy, ktype="fact", project="demo",
         filter_name="pytest",
     )
@@ -81,7 +81,7 @@ def test_save_without_filter_no_reduction(store):
     store.db.commit()
 
     content = "normal knowledge content"
-    rid, _, _, _ = store.save_knowledge(
+    rid, *_save = store.save_knowledge(
         sid="s1", content=content, ktype="fact", project="demo"
     )
     saved = store.db.execute(
@@ -127,7 +127,7 @@ def test_unknown_filter_name_falls_back_to_raw(store):
     store.db.commit()
 
     content = "raw content unchanged"
-    rid, _, _, _ = store.save_knowledge(
+    rid, *_save = store.save_knowledge(
         sid="s1", content=content, ktype="fact", project="demo",
         filter_name="bogus_filter_name",
     )

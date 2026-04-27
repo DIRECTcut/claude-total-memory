@@ -220,7 +220,7 @@ def save_decision(store: Any, decision: Decision, session_id: str | None = None)
     context_json = decision.to_context_json()
     project = decision.project or "general"
 
-    rid, _was_dedup, _was_red, _priv = store.save_knowledge(
+    rid, _was_dedup, _was_red, _priv, _qm = store.save_knowledge(
         sid,
         content,
         "decision",

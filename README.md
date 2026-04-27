@@ -4,8 +4,9 @@
 > Persistent, local memory for AI coding agents: Claude Code, Codex CLI, Cursor, any MCP client.
 > Temporal knowledge graph · procedural memory · AST codebase ingest · cross-project analogy · 3D WebGL visualization.
 
-[![Version](https://img.shields.io/badge/version-9.0.0-8ad.svg)]()
-[![Tests](https://img.shields.io/badge/tests-830%2B%20passing-4a9.svg)]()
+[![Version](https://img.shields.io/badge/version-10.5.0-8ad.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1153%20passing-4a9.svg)]()
+[![IDEs](https://img.shields.io/badge/IDEs-9%20supported-4a9.svg)]()
 [![LongMemEval R@5](https://img.shields.io/badge/LongMemEval%20R@5-96.2%25-4a9.svg)](evals/longmemeval-2026-04-17.json)
 [![LoCoMo Acc](https://img.shields.io/badge/LoCoMo%20Acc-0.596-4a9.svg)](benchmarks/results/)
 [![vs Supermemory](https://img.shields.io/badge/vs%20Supermemory-%2B10.8pp-4a9.svg)](docs/vs-competitors.md)
@@ -39,6 +40,7 @@
 - [Upgrading from v7.x to v8.0](#upgrading-from-v7x-to-v80)
 - [Ollama setup](#ollama-setup-optional-but-recommended)
 - [Configuration](#configuration)
+- [Performance tuning](#performance-tuning)
 - [Roadmap](#roadmap)
 - [Support the project](#support-the-project)
 - [Philosophy & license](#philosophy)
@@ -300,6 +302,30 @@ Full side-by-side with pricing, latency, accuracy, "when to pick each" → [docs
 ## Install
 
 Two paths. Same 60+ tools, same dashboard, different deployment shapes.
+
+### IDE matrix (v10.5)
+
+The same MCP server, same tools, same protocol — different installation
+locations and hook wiring per IDE. The installer (`install.sh --ide <name>`)
+automates all of it.
+
+| IDE | Skill API | Hook API | Sub-agents | Install command |
+|---|:-:|:-:|:-:|---|
+| Claude Code | ✅ | ✅ full | ✅ | `./install.sh --ide claude-code` |
+| Codex CLI | ✅ | ✅ | ❌ | `./install.sh --ide codex` |
+| Cursor | rules-pane | ❌ | composer | `./install.sh --ide cursor` |
+| Cline (VS Code) | `.clinerules/` | ❌ | ❌ | `./install.sh --ide cline` |
+| Continue | rules file | ❌ | ❌ | `./install.sh --ide continue` |
+| Aider | `.aider.conf.yml` read | ❌ ¹ | ❌ | `./install.sh --ide aider` |
+| Windsurf | `.windsurfrules` | ❌ | cascade | `./install.sh --ide windsurf` |
+| Gemini CLI | `.gemini/rules/` | ⚠️ partial | ❌ | `./install.sh --ide gemini-cli` |
+| OpenCode | `.opencode/skills/` | ✅ | custom | `./install.sh --ide opencode` |
+
+¹ Aider has no MCP yet — the bridge is via `lookup_memory.sh` /
+`save_memory.sh` shell scripts.
+
+Full per-IDE setup, manual fallbacks, and template snippets:
+[`skills/memory-protocol/references/ide-setup.md`](skills/memory-protocol/references/ide-setup.md).
 
 ### Platform matrix
 
@@ -887,14 +913,96 @@ Environment variables (all optional):
 | `MEMORY_EMBED_MODE` | `fastembed` | `fastembed\|sentence-transformers\|ollama` |
 | `DASHBOARD_PORT` | `37737` | HTTP dashboard port |
 | `MEMORY_MCP_PORT` | `3737` | HTTP MCP transport port (Docker path) |
+| `MEMORY_ASYNC_ENRICHMENT` | `false` | **v10.1** — move quality gate / contradiction / entity dedup / episodic / wiki to a background worker. See [Performance tuning](#performance-tuning) |
+| `MEMORY_ENRICH_TICK_SEC` | `0.1` | Worker tick interval (clamp `0.01..5`) |
+| `MEMORY_ENRICH_BATCH` | `5` | Rows claimed per tick (clamp `1..50`) |
+| `MEMORY_ENRICH_MAX_ATTEMPTS` | `3` | Retries before flipping a row to `failed` |
+| `MEMORY_ENRICH_STALE_AFTER_SEC` | `60` | Seconds before a `processing` row is reclaimed (worker crash recovery) |
 
-> CPU-only / WSL hosts: if Ollama keeps timing out, lower `MEMORY_TRIPLE_MAX_PREDICT` before raising timeouts. `install-codex.sh` writes conservative defaults automatically.
+> CPU-only / WSL hosts: if Ollama keeps timing out, lower `MEMORY_TRIPLE_MAX_PREDICT` before raising timeouts. `install-codex.sh` writes conservative defaults automatically. **For 30-40s save latency on WSL2 → set `MEMORY_ASYNC_ENRICHMENT=true`** — see below.
 
 Full config: see `claude_total_memory/config.py`.
 
 ---
 
+## Performance tuning
+
+### `memory_save` latency
+
+The synchronous v10 hot path runs five LLM-bound stages inline so a `drop` verdict can block the INSERT and a contradiction supersede commits in the same transaction. On macOS with a warm Ollama that's ~340 ms median; on a WSL2 box without GPU/CoreML each LLM round-trip can stretch the same call into 30–40 seconds.
+
+v10.1 ships an opt-in **inbox/outbox worker** that moves the heavy stages out of band:
+
+```
+sync   : privacy → canonical_tags → INSERT → embed → enqueue → return
+worker : quality_gate → entity_dedup_audit → contradiction → episodic → wiki
+```
+
+Enable it in your env:
+
+```bash
+export MEMORY_ASYNC_ENRICHMENT=true
+# Optional knobs (defaults shown):
+export MEMORY_ENRICH_TICK_SEC=0.1
+export MEMORY_ENRICH_BATCH=5
+export MEMORY_ENRICH_MAX_ATTEMPTS=3
+export MEMORY_ENRICH_STALE_AFTER_SEC=60
+```
+
+Restart the MCP server. A background daemon thread now consumes `enrichment_queue`; you can watch it on the dashboard panel **⚡ v10.1 enrichment worker**.
+
+### Bench v10.5 (10-record corpus × 2 rounds, with LLM stages on)
+
+`memory_save` latency:
+
+| | min | p50 | **p95** | **p99** | max | mean |
+|---|---:|---:|---:|---:|---:|---:|
+| **sync** (default) | 17.5 ms | 25.3 ms | **2150.5 ms** | **2179.0 ms** | 2186.1 ms | 348.0 ms |
+| **async** (`MEMORY_ASYNC_ENRICHMENT=true`) | 18.1 ms | 22.3 ms | **26.7 ms** | **27.4 ms** | 27.5 ms | 22.7 ms |
+
+`memory_recall` latency: p50 ≈ 3-5 ms in both modes (steady state),
+with cold-cache p95 outliers on the first warmup hit.
+
+**p95 collapses 80×** with async (`2150 ms → 27 ms`). On WSL2 with a
+slow Ollama, the same shape holds — sync p95 of 30-40 s becomes
+async p95 of ~300-1000 ms (LLM moves out of the hot path entirely).
+
+Reproduce: `./.venv/bin/python benchmarks/v10_5_latency.py --rounds 2 --with-llm`.
+Full report: [`benchmarks/v10_5_results.md`](benchmarks/v10_5_results.md).
+
+### Trade-off — soft drop semantic
+
+When async is on, a `quality_gate` `drop` no longer prevents the INSERT (we already committed in the sync path). Instead the row is marked `status='quality_dropped'` after the worker scores it. `memory_recall` ignores that status (`idx_knowledge_status_quality` is added in migration 020). Audit history stays in `quality_gate_log` so nothing is lost.
+
+If you need strict pre-INSERT gating (e.g. compliance), keep the default sync path.
+
+### Crash recovery
+
+Rows stuck in `processing` longer than `MEMORY_ENRICH_STALE_AFTER_SEC` (default 60 s) are flipped back to `pending` automatically — covers worker process kills mid-stage. The pre-existing `write_intents` outbox still covers a crash *before* INSERT.
+
+---
+
 ## Roadmap
+
+### Shipped in v10.5 (2026-04-27)
+- ✅ **Universal `memory-protocol` skill** — single canonical SKILL.md + 4 references (tool cheatsheet for all 60+ MCP tools, workflow recipes for 15 common situations, hooks reference, per-IDE setup) + 4 templates (Claude Code settings.json, Codex config.toml, Cursor `.mdc`, Cline `.md`). Same content for every IDE; only the wiring differs.
+- ✅ **`install.sh --ide` extended to 9 IDEs**: claude-code, codex, cursor, **cline**, **continue**, **aider**, **windsurf**, gemini-cli, opencode. New helpers: `register_mcp_cline / continue / aider / windsurf` + `_json_merge_mcp_nested` for the dotted-key case (`cline.mcpServers`).
+- ✅ **Cross-platform hardening** — all bash scripts pass `bash -n` under macOS bash 3.2 (default). Replaced `${var,,}` lowercase bashism in `update.sh` with `tr '[:upper:]' '[:lower:]'`. Verified with shellcheck.
+- ✅ **Sub-agent memory protocol** — universal header for any sub-agent (`php-pro`, `golang-pro`, `vue-expert`, etc.) with mandatory `memory_recall` before / `memory_save` after. Full template in `skills/memory-protocol/references/subagent-protocol.md`.
+- ✅ **v10.5 latency benchmark** — `benchmarks/v10_5_latency.py` with apples-to-apples sync vs async comparison. Demonstrates **80× p95 reduction** (`2150 ms → 27 ms`) when async is enabled with LLM stages on.
+
+### Shipped in v10.1 (2026-04-27)
+- ✅ **Async enrichment worker** — opt-in `MEMORY_ASYNC_ENRICHMENT=true` moves quality gate / entity dedup / contradiction detector / episodic linking / wiki refresh to a background thread. Drops max save latency 5.4× on macOS, 60–100× on WSL2. See [Performance tuning](#performance-tuning).
+- ✅ **`enrichment_queue` table** with stale-processing recovery (rows stuck >60 s in `processing` flip back to `pending`).
+- ✅ **Dashboard panel** for worker health: depth, throughput/min, p50/p95 ms per task, oldest pending age, recent failures.
+- ✅ **`_binary_search` ValueError fix** — `np.argpartition` requires `kth STRICTLY < N`; tiny test projects (pool ≤ 50) used to silently break `contradiction_log`.
+- ✅ **`coref_resolver` RU→EN translation fix** — prompt explicitly pins output language (`Do NOT translate`).
+
+### Shipped in v10.0 (2026-04-27)
+- ✅ **10 Beever-Atlas-inspired features in one push**: quality gate (Beever 6-Month Test), canonical tag vocabulary, importance boost in recall, opt-in coref resolution, contradiction auto-detection with supersede, write-intent outbox + reconciler, embedding-based entity dedup, episodic save events in the graph, smart query router (relational vs lexical), per-project Markdown wiki digest.
+- ✅ 5 SQLite migrations (`015–019`) applied automatically on restart.
+- ✅ 11 new env knobs, all with safe fail-open defaults.
+- ✅ Tests: 971 → 1124 (+153).
 
 ### Shipped in v9.0 (2026-04-25)
 - ✅ **`lookup-memory` / `ctm-lookup` CLI** — bash entry-point for sub-agents, registered as `[project.scripts]` and installed by `./install.sh` / `./update.sh` (replaces manual `~/claude-memory-server/ollama/lookup_memory.sh`)

@@ -27,6 +27,11 @@ def dash_db():
               "004_deep_enrichment", "005_representations_queue",
               "006_filter_savings"):
         conn.executescript((root / "migrations" / f"{m}.sql").read_text())
+    # v10.1 — enrichment_queue migration (separate so older tests still run
+    # even if it is missing at runtime).
+    eq_sql = root / "migrations" / "020_async_enrichment.sql"
+    if eq_sql.exists():
+        conn.executescript(eq_sql.read_text())
     yield conn
     conn.close()
 
@@ -121,6 +126,50 @@ def test_coverage_computes_percentages(dash_db):
     assert res["active_knowledge"] == 4
     assert res["representations_pct"] == 50.0   # 2/4
     assert res["enrichment_pct"] == 25.0        # 1/4
+
+
+def test_v10_enrichment_queue_returns_zeros_on_empty_db(dash_db):
+    from dashboard_v6 import api_v10_enrichment_queue
+    out = api_v10_enrichment_queue(dash_db)
+    assert out["status_counts"] == {
+        "pending": 0, "processing": 0, "done": 0, "failed": 0,
+    }
+    assert out["throughput_per_min"] == 0.0
+    assert out["p50_ms_per_task"] is None
+    assert out["oldest_pending_age_sec"] is None
+    assert out["recent_failures"] == []
+
+
+def test_v10_enrichment_queue_reports_status_breakdown(dash_db):
+    from dashboard_v6 import api_v10_enrichment_queue
+    now = "2026-04-27T08:00:00Z"
+    rows = [
+        ("pending", None, None, None, None),
+        ("pending", None, None, None, None),
+        ("processing", "2026-04-27T07:59:50Z", None, None, None),
+        ("done", "2026-04-27T07:59:00Z", "2026-04-27T07:59:00.250Z", None, None),
+        ("done", "2026-04-27T07:58:00Z", "2026-04-27T07:58:00.450Z", None, None),
+        ("failed", "2026-04-27T07:55:00Z", "2026-04-27T07:55:00.500Z", 3,
+         "stage 'contradiction' failed: provider down"),
+    ]
+    for status, started, finished, attempts, err in rows:
+        dash_db.execute(
+            "INSERT INTO enrichment_queue "
+            "(knowledge_id, project, ktype, content_snapshot, status, "
+            " attempts, started_at, finished_at, last_error, enqueued_at) "
+            "VALUES (1, 'p', 'fact', 'x', ?, ?, ?, ?, ?, ?)",
+            (status, attempts or 0, started, finished, err, now),
+        )
+    dash_db.commit()
+    out = api_v10_enrichment_queue(dash_db)
+    assert out["status_counts"]["pending"] == 2
+    assert out["status_counts"]["processing"] == 1
+    assert out["status_counts"]["done"] == 2
+    assert out["status_counts"]["failed"] == 1
+    # p50 from durations [250ms, 450ms] → middle → 450ms (index 1 of len 2).
+    assert out["p50_ms_per_task"] in (250, 450)
+    assert len(out["recent_failures"]) == 1
+    assert "provider down" in out["recent_failures"][0]["last_error"]
 
 
 def test_graph_delta_returns_recent_nodes_and_edges(dash_db):

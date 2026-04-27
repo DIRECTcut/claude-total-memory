@@ -4374,6 +4374,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif path == "/api/v6/coverage":
                 from dashboard_v6 import api_v6_coverage
                 self._send_json(api_v6_coverage(db))
+            # v10.1 — async enrichment worker health
+            elif path == "/api/v10/enrichment-queue":
+                from dashboard_v6 import api_v10_enrichment_queue
+                self._send_json(api_v10_enrichment_queue(db))
             elif path == "/api/graph/delta":
                 from dashboard_v6 import api_graph_delta
                 since = p("since") or None

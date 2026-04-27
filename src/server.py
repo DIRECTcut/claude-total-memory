@@ -109,6 +109,25 @@ DECAY_HALF_LIFE = int(os.environ.get("DECAY_HALF_LIFE", "90"))  # days
 ARCHIVE_AFTER_DAYS = int(os.environ.get("ARCHIVE_AFTER_DAYS", "180"))
 PURGE_AFTER_DAYS = int(os.environ.get("PURGE_AFTER_DAYS", "365"))
 OBSERVATION_RETENTION_DAYS = int(os.environ.get("OBSERVATION_RETENTION_DAYS", "30"))
+
+# v10 — importance multipliers applied to the final recall score so a
+# `critical` decision outranks ten `medium` observations at the same RRF
+# rank. Override individual values via env (e.g. MEMORY_IMPORTANCE_BOOST_CRITICAL=2.0).
+def _imp_boost(level: str, default: float) -> float:
+    raw = os.environ.get(f"MEMORY_IMPORTANCE_BOOST_{level.upper()}")
+    if raw is None:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+_IMPORTANCE_BOOST = {
+    "critical": _imp_boost("critical", 1.5),
+    "high":     _imp_boost("high",     1.2),
+    "medium":   _imp_boost("medium",   1.0),
+    "low":      _imp_boost("low",      0.8),
+}
 USE_ADVANCED_RAG = os.environ.get("USE_ADVANCED_RAG", "auto")  # auto|true|false — HyDE + reranker
 USE_BINARY_SEARCH = os.environ.get("USE_BINARY_SEARCH", "auto")  # auto|true|false — binary quantization
 LOG = lambda msg: sys.stderr.write(f"[memory-mcp] {msg}\n")
@@ -191,7 +210,14 @@ class Store:
         for d in ["raw", "chroma", "transcripts", "queue", "backups", "extract-queue"]:
             (MEMORY_DIR / d).mkdir(parents=True, exist_ok=True)
 
-        self.db = sqlite3.connect(str(MEMORY_DIR / "memory.db"))
+        # check_same_thread=False is safe here because:
+        # 1. We run in WAL mode (concurrent readers + a single writer).
+        # 2. busy_timeout=5000 absorbs the rare write contention.
+        # 3. The async enrichment worker runs in a daemon thread that
+        #    needs to read/write through the same Connection object.
+        self.db = sqlite3.connect(
+            str(MEMORY_DIR / "memory.db"), check_same_thread=False
+        )
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
@@ -246,6 +272,24 @@ class Store:
         # silent corruption when MEMORY_EMBED_PROVIDER is swapped on a
         # live DB without re-embedding.
         self._check_embed_dim_compat()
+
+        # v10 — replay any save_knowledge intents that were created but
+        # never committed (process crash mid-save). Idempotent: dedup
+        # path swallows re-inserts of the same content.
+        self._reconcile_outbox_at_startup()
+
+        # v10.1 — Async enrichment worker (inbox/outbox style). When
+        # MEMORY_ASYNC_ENRICHMENT=true, the heavy LLM-bound stages of
+        # save_knowledge (quality gate, entity dedup audit, contradiction
+        # detector, episodic event linking, wiki refresh) run in this
+        # background thread instead of synchronously. Default OFF so
+        # existing deployments keep their current latency profile.
+        try:
+            import enrichment_worker as _ew
+            self._enrich_worker = _ew.start_worker(self)
+        except Exception as e:
+            LOG(f"enrichment worker init skipped: {e}")
+            self._enrich_worker = None
 
     @property
     def embedder(self):
@@ -584,6 +628,57 @@ class Store:
         """Remove embedding for a knowledge record."""
         self.db.execute("DELETE FROM embeddings WHERE knowledge_id=?", (knowledge_id,))
 
+    def _reconcile_outbox_at_startup(self):
+        """v10 — replay any save_knowledge intents from a previous crash.
+
+        Runs on every Store.__init__ after migrations apply. Idempotent
+        thanks to the existing dedup path (`_find_duplicate`): a re-run
+        of a payload whose record was already inserted returns the
+        existing id and the intent is closed as 'superseded'.
+        """
+        try:
+            import outbox
+            if not outbox.is_enabled():
+                return
+            # Confirm the table exists — bail silently otherwise so older
+            # databases that haven't applied migration 017 yet don't crash.
+            try:
+                self.db.execute("SELECT 1 FROM write_intents LIMIT 1").fetchone()
+            except Exception:
+                return
+
+            def _replay(payload):
+                # `_from_outbox=True` short-circuits create_intent so the
+                # replayed save doesn't create another intent for the
+                # same payload.
+                rid, was_dedup, *_ = self.save_knowledge(
+                    payload.get("sid", ""),
+                    payload.get("content", ""),
+                    payload.get("ktype", "fact"),
+                    project=payload.get("project", "general"),
+                    tags=payload.get("tags") or [],
+                    context=payload.get("context", "") or "",
+                    branch=payload.get("branch", "") or "",
+                    skip_dedup=False,
+                    filter_name=payload.get("filter_name"),
+                    importance=payload.get("importance", "medium"),
+                    skip_quality=True,           # don't re-score on replay
+                    coref=False,                 # don't re-rewrite on replay
+                    _from_outbox=True,
+                )
+                # On dedup, return None so reconcile records 'dedup' status.
+                return None if was_dedup else rid
+
+            counts = outbox.reconcile_pending(self.db, replay_fn=_replay)
+            if any(counts.values()):
+                LOG(
+                    f"Outbox reconcile at startup: "
+                    f"replayed={counts['replayed']} dedup={counts['dedup']} "
+                    f"failed={counts['failed']} skipped={counts['skipped']}"
+                )
+        except Exception as exc:
+            LOG(f"outbox reconcile skipped: {exc}")
+
     def _binary_search(self, query_embedding, n_candidates=50, project=None, n_results=10):
         """Two-level binary quantization search: Hamming pre-filter → cosine re-rank."""
         import numpy as np
@@ -616,9 +711,14 @@ class Store:
         xor_result = np.bitwise_xor(bin_vecs, q_binary)
         hamming_distances = popcount_lut[xor_result].sum(axis=1)
 
-        # 4. Top-N candidates (lowest Hamming distance)
+        # 4. Top-N candidates (lowest Hamming distance).
+        # argpartition requires kth STRICTLY < N, so when the candidate pool is
+        # smaller than n_candidates we just take everything.
         n_cand = min(n_candidates, len(kid_list))
-        top_indices = np.argpartition(hamming_distances, n_cand)[:n_cand]
+        if n_cand < len(kid_list):
+            top_indices = np.argpartition(hamming_distances, n_cand)[:n_cand]
+        else:
+            top_indices = np.arange(len(kid_list))
 
         # 5. Load float32 vectors for candidates → cosine re-rank
         candidate_kids = [int(kid_list[i]) for i in top_indices]
@@ -1066,14 +1166,48 @@ class Store:
     # ── CRUD ──
 
     def save_knowledge(self, sid, content, ktype, project="general", tags=None,
-                        context="", branch="", skip_dedup=False, filter_name=None):
-        """Save knowledge. Returns (record_id, was_deduplicated, was_redacted, private_sections).
+                        context="", branch="", skip_dedup=False, filter_name=None,
+                        importance="medium", skip_quality=False, coref=None,
+                        _from_outbox=False):
+        """Save knowledge. Returns
+        ``(record_id, was_deduplicated, was_redacted, private_sections, quality_meta)``.
 
         Optional `filter_name` runs the content through a TOML-defined
         rtk-style pipeline BEFORE dedup/save — shrinks noisy CLI output
         (pytest, cargo, etc.) while a hard whitelist keeps URLs/paths/code.
+
+        v10: a quality gate (`src/quality_gate.py`) scores the record
+        synchronously before dedup. Records below the configured threshold
+        are dropped; in that case ``record_id`` is ``None`` and
+        ``quality_meta['decision'] == 'drop'``. ``skip_quality=True`` bypasses
+        the gate (used by `memory_update` / `self_reflect` where the content
+        is already validated). The optional ``importance`` field
+        (``critical|high|medium|low``, default ``medium``) is persisted on
+        the row and consumed by `fusion.py` to boost recall ranking.
         """
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        # v10 — Outbox / WriteIntent. Persist the original payload before
+        # any work so a mid-save crash is recoverable. _from_outbox=True
+        # signals a replay from the reconciler — skip intent creation
+        # to avoid an infinite intent → replay → intent loop.
+        intent = None
+        if not _from_outbox:
+            try:
+                import outbox as _ob
+                intent = _ob.create_intent(
+                    self.db,
+                    payload={
+                        "sid": sid, "content": content, "ktype": ktype,
+                        "project": project, "tags": list(tags or []),
+                        "context": context or "", "branch": branch or "",
+                        "filter_name": filter_name, "importance": importance,
+                    },
+                    session_id=sid, content=content, ktype=ktype, project=project,
+                )
+            except Exception as e:
+                LOG(f"outbox create_intent skipped: {e}")
+                intent = None
 
         # Inline <private>...</private> tag redaction (P0.1) — BEFORE autofilter/dedup/sanitize
         private_sections = 0
@@ -1131,19 +1265,143 @@ class Store:
         context, redacted_x = self._sanitize_content(context)
         was_redacted = redacted_c or redacted_x
 
+        # v10 — Coreference rewrite (opt-in). Expands pronouns/deictics in
+        # the content using the last N records from the same session as
+        # context, so semantic search later returns a self-contained
+        # fragment instead of "after this it broke" mystery prose. Off by
+        # default — caller must opt in (e.g. extract_transcript) or set
+        # MEMORY_COREF_ENABLED=true. Always falls through on error.
+        try:
+            from coref_resolver import resolve as _coref_resolve
+            cr = _coref_resolve(content, db=self.db, session_id=sid, coref=coref)
+            if cr.decision == "rewritten":
+                LOG(f"coref rewritten record (latency_ms={cr.latency_ms})")
+                content = cr.content
+        except Exception as e:
+            LOG(f"coref resolver skipped: {e}")
+
+        # v10 — Canonical-vocabulary tag normalisation. Free-form input tags
+        # are mapped to their canonical form (with the original kept alongside
+        # so legacy synonym recall still works). Failures are non-fatal: the
+        # gate must never block a save just because the vocabulary file moved.
+        try:
+            from canonical_tags import normalise_tags as _norm_tags
+            tags = _norm_tags(tags or [])
+        except Exception as e:
+            LOG(f"canonical_tags normalisation skipped: {e}")
+            tags = list(tags or [])
+
+        # v10 — Pre-write entity dedup. Tags that are NOT canonical topics
+        # get a second-chance lookup against existing graph_nodes via
+        # embedding cosine; matches above MEMORY_ENTITY_DEDUP_THRESHOLD
+        # (default 0.85) are rewritten to the canonical entity name. We
+        # batch this AFTER canonical_tags so we don't waste embed calls on
+        # tags the cheap path already resolved.
+        entity_dedup_decisions: list = []
+        try:
+            import entity_dedup as _ed
+            if _ed._enabled():
+                # Lazily fetch candidates only if there are non-canonical tags
+                # left to consider.
+                cand_pool = _ed.production_candidates_query(self.db, project=project)
+                if cand_pool and tags:
+                    embed_fn = lambda texts: self.embed(texts) or None
+                    new_tags, entity_dedup_decisions = _ed.canonicalize_entity_tags(
+                        tags, candidates=cand_pool, embed_fn=embed_fn,
+                    )
+                    if new_tags != tags:
+                        tags = new_tags
+        except Exception as e:
+            LOG(f"entity_dedup skipped: {e}")
+
+        # v10.1 — Async enrichment switch. When MEMORY_ASYNC_ENRICHMENT=true,
+        # we skip the synchronous quality gate (and the contradiction
+        # detector / entity dedup audit / episodic event / wiki refresh
+        # blocks further down). The expensive stages run in a background
+        # worker thread that consumes `enrichment_queue`. Tradeoff: a
+        # quality-gate 'drop' verdict marks the row as `quality_dropped`
+        # *after* the INSERT, instead of preventing the INSERT outright.
+        try:
+            import enrichment_worker as _ew
+            _async_enrich = _ew._enabled()
+        except Exception:
+            _async_enrich = False
+
+        # v10 — Quality gate (Beever-style "6-Month Test"). Synchronous,
+        # runs before dedup so dropped records never pollute storage. Gate
+        # fails open: any LLM error or unavailability lets the save proceed.
+        quality_meta: dict | None = None
+        if not skip_quality and not _async_enrich:
+            try:
+                from quality_gate import score_quality, log_decision
+                score = score_quality(content, ktype=ktype, project=project)
+                quality_meta = {
+                    "decision": score.decision,
+                    "total": score.total,
+                    "specificity": score.specificity,
+                    "actionability": score.actionability,
+                    "verifiability": score.verifiability,
+                    "reason": score.reason,
+                    "threshold": score.threshold,
+                    "provider": score.provider,
+                    "model": score.model,
+                    "latency_ms": score.latency_ms,
+                }
+                if score.decision == "drop":
+                    # Journal the rejection and bail before dedup/insert.
+                    log_decision(
+                        self.db, score, project=project, ktype=ktype,
+                        content=content, knowledge_id=None,
+                    )
+                    LOG(
+                        f"quality-gate dropped record (score={score.total:.2f}<"
+                        f"{score.threshold}, reason={score.reason!r})"
+                    )
+                    # Outbox: a quality-gate drop is a *committed* outcome
+                    # (the record will not be saved by any future replay
+                    # either) — mark superseded with knowledge_id=None.
+                    if intent is not None:
+                        try:
+                            import outbox as _ob
+                            _ob.mark_superseded(self.db, intent, None)
+                        except Exception:
+                            pass
+                    return None, False, was_redacted, private_sections, quality_meta
+                # Non-drop decisions ('skip'/'error'/'pass') only journal
+                # when MEMORY_QUALITY_LOG_ALL=1; helper handles the gating.
+                log_decision(
+                    self.db, score, project=project, ktype=ktype,
+                    content=content, knowledge_id=None,
+                )
+            except Exception as e:
+                # Quality gate must never break the underlying save.
+                LOG(f"quality_gate error (continuing): {e}")
+
         if not skip_dedup:
             dup_id = self._find_duplicate(content, ktype, project)
             if dup_id:
                 self.db.execute("UPDATE knowledge SET last_confirmed=? WHERE id=?", (now, dup_id))
                 self.db.commit()
                 LOG(f"Dedup: updated last_confirmed for id={dup_id}")
-                return dup_id, True, was_redacted, private_sections
+                if intent is not None:
+                    try:
+                        import outbox as _ob
+                        _ob.mark_superseded(self.db, intent, dup_id)
+                    except Exception:
+                        pass
+                return dup_id, True, was_redacted, private_sections, quality_meta
+
+        # Validate importance enum; fall back to 'medium' on bad input.
+        importance_value = (importance or "medium").lower()
+        if importance_value not in ("critical", "high", "medium", "low"):
+            importance_value = "medium"
 
         cur = self.db.execute("""
             INSERT INTO knowledge (session_id,type,content,context,project,tags,source,confidence,
-                                   created_at,last_confirmed,recall_count,branch)
-            VALUES (?,?,?,?,?,?,'explicit',1.0,?,?,0,?)
-        """, (sid, ktype, content, context, project, json.dumps(tags or []), now, now, branch or ""))
+                                   created_at,last_confirmed,recall_count,branch,importance)
+            VALUES (?,?,?,?,?,?,'explicit',1.0,?,?,0,?,?)
+        """, (sid, ktype, content, context, project, json.dumps(tags or []), now, now,
+              branch or "", importance_value))
         self.db.commit()
         rid = cur.lastrowid
 
@@ -1167,6 +1425,19 @@ class Store:
                                 tags if isinstance(tags, list) else json.loads(tags or "[]"))
         except Exception as e:
             LOG(f"Auto-link error: {e}")
+
+        # v10 — Episodic link: spawn an Event node and connect every
+        # entity-typed graph node linked to this record via MENTIONED_IN.
+        # Lets future queries answer "show me saves where Bob and
+        # Postgres were mentioned together" in one graph traversal.
+        # Skipped in async mode — the worker handles it.
+        if not _async_enrich:
+            try:
+                import episodic as _ep
+                _ep.record_save_event(self.db, knowledge_id=rid,
+                                      project=project, session_id=sid)
+            except Exception as e:
+                LOG(f"episodic event creation skipped: {e}")
 
         # Enqueue for async deep triple extraction (processed by reflection agent)
         try:
@@ -1220,7 +1491,128 @@ class Store:
             except Exception as e:
                 LOG(f"filter_savings log error: {e}")
 
-        return rid, False, was_redacted, private_sections
+        # Backfill the audit log row with the freshly minted knowledge_id so
+        # 'pass' rows in quality_gate_log can be joined back to records.
+        if quality_meta and quality_meta.get("decision") == "pass":
+            try:
+                self.db.execute(
+                    "UPDATE quality_gate_log SET knowledge_id=? "
+                    "WHERE id = (SELECT MAX(id) FROM quality_gate_log "
+                    "            WHERE knowledge_id IS NULL AND decision='pass')",
+                    (rid,),
+                )
+                self.db.commit()
+            except Exception as e:
+                LOG(f"quality_gate_log backfill error: {e}")
+
+        # v10 — Persist entity-dedup decisions to audit log now that the
+        # knowledge_id is known. Skipped in async mode — the worker
+        # re-walks the canonicalisation and writes decisions itself.
+        if entity_dedup_decisions and not _async_enrich:
+            try:
+                import entity_dedup as _ed
+                _ed.log_decisions(
+                    self.db, entity_dedup_decisions,
+                    knowledge_id=rid, project=project,
+                )
+            except Exception as e:
+                LOG(f"entity_dedup audit log skipped: {e}")
+
+        # v10 — Auto-contradiction detection. For decision/solution saves,
+        # run a semantic search against existing same-type records in the
+        # same project and ask the LLM whether the new record supersedes
+        # any of them. ≥0.8 confidence → automatic supersession; 0.5-0.8 →
+        # 'flagged' for human review. Fail-open: any error simply lets the
+        # save complete without supersession.
+        # Skipped in async mode — the worker runs the same sweep without
+        # blocking the caller.
+        if not _async_enrich:
+            try:
+                from contradiction_detector import (
+                    should_run as _cd_should_run,
+                    detect_contradictions as _cd_detect,
+                    production_candidates_query as _cd_fetch,
+                    production_llm_call as _cd_llm,
+                    apply_and_log as _cd_apply,
+                )
+                ok, reason = _cd_should_run(ktype)
+                if ok and embs:
+                    cand_pool = self._binary_search(embs[0], n_candidates=50,
+                                                    project=project, n_results=10)
+                    # Drop self from the candidate pool — embedding search may
+                    # surface the row we just inserted.
+                    cand_pool = [(cid, cos) for cid, cos in cand_pool if cid != rid]
+                    if cand_pool:
+                        verdicts = _cd_detect(
+                            content,
+                            ktype=ktype, project=project,
+                            candidate_pool=cand_pool,
+                            fetch_candidates=lambda ids: _cd_fetch(
+                                self.db, project=project, ktype=ktype, candidate_ids=ids
+                            ),
+                            llm_fn=_cd_llm,
+                        )
+                        if verdicts:
+                            counts = _cd_apply(self.db, verdicts, new_id=rid)
+                            if counts.get("superseded"):
+                                LOG(
+                                    f"contradiction-detector superseded "
+                                    f"{counts['superseded']} record(s) on save id={rid}"
+                                )
+            except Exception as e:
+                LOG(f"contradiction_detector skipped: {e}")
+
+        # v10 — Outbox: mark intent as committed now that all the side
+        # effects (insert, embed, queues, contradiction sweep) are done.
+        if intent is not None:
+            try:
+                import outbox as _ob
+                _ob.mark_committed(self.db, intent, rid)
+            except Exception as e:
+                LOG(f"outbox mark_committed skipped: {e}")
+
+        # v10 — Project wiki auto-refresh. Off by default; opt in via
+        # `MEMORY_WIKI_AUTO_REFRESH_EVERY_N=10` to regenerate the
+        # per-project markdown digest after every 10th save_knowledge
+        # commit. Wikis live at <MEMORY_DIR>/wikis/<project>.md.
+        # Skipped in async mode — the worker handles it (still cheap when
+        # auto-refresh is off, but keeps the sync path strictly minimal).
+        if not _async_enrich:
+            try:
+                import project_wiki as _pw
+                _pw.maybe_auto_refresh(
+                    self.db, project=project, save_count=rid,
+                    output_dir=str(MEMORY_DIR / "wikis"),
+                )
+            except Exception as e:
+                LOG(f"project_wiki auto-refresh skipped: {e}")
+
+        # v10.1 — In async mode, hand off the heavy work to the worker.
+        # Quality meta is reported as 'pending' so the MCP client knows
+        # the gate verdict will arrive later (visible via memory_history
+        # / quality_gate_log).
+        if _async_enrich:
+            try:
+                import enrichment_worker as _ew
+                _ew.enqueue(
+                    self.db,
+                    knowledge_id=rid,
+                    session_id=sid,
+                    project=project,
+                    ktype=ktype,
+                    content_snapshot=content,
+                    tags_snapshot=tags or [],
+                    importance=importance_value,
+                    skip_quality=skip_quality,
+                )
+                quality_meta = {
+                    "decision": "pending",
+                    "reason": "queued for async enrichment",
+                }
+            except Exception as e:
+                LOG(f"enrichment enqueue failed (sync fallback would re-run heavy stages): {e}")
+
+        return rid, False, was_redacted, private_sections, quality_meta
 
     def bump_recall(self, ids):
         """Strengthen memories that are recalled (spaced repetition effect)."""
@@ -2246,30 +2638,37 @@ class Recall:
             decay = Store._decay_factor(lc, DECAY_HALF_LIFE)
             recall_boost = min(0.3, (item["r"].get("recall_count", 0) or 0) * 0.05)
             item["decay_factor"] = decay + recall_boost
+            # v10 — importance boost (defaults to neutral 1.0 for legacy rows
+            # without the column or with NULL/unknown values).
+            imp = (item["r"].get("importance") or "medium").lower()
+            item["importance_boost"] = _IMPORTANCE_BOOST.get(imp, 1.0)
 
         # ── Score fusion: RRF or legacy ──
         if use_rrf and tier_rankings:
             # Compute RRF scores across all tiers
             rrf_scores = self._rrf_fuse(tier_rankings, self.RRF_WEIGHTS, self.RRF_K)
 
-            # Apply decay to RRF scores and store both scores
+            # Apply decay + importance to RRF scores and store both scores
             for doc_id, rrf_sc in rrf_scores.items():
                 if doc_id in results:
-                    results[doc_id]["rrf_score"] = rrf_sc * results[doc_id]["decay_factor"]
-                    results[doc_id]["score"] *= results[doc_id]["decay_factor"]
+                    item = results[doc_id]
+                    multiplier = item["decay_factor"] * item["importance_boost"]
+                    item["rrf_score"] = rrf_sc * multiplier
+                    item["score"] *= multiplier
 
             # Documents not in any tier ranking (shouldn't happen, but safety net)
             for doc_id, item in results.items():
                 if "rrf_score" not in item:
-                    item["score"] *= item["decay_factor"]
+                    multiplier = item["decay_factor"] * item["importance_boost"]
+                    item["score"] *= multiplier
                     item["rrf_score"] = item["score"] * 0.5  # penalized fallback
 
             # Sort by fused RRF score
             ranked = sorted(results.values(), key=lambda x: x.get("rrf_score", 0), reverse=True)[:limit * 2]
         else:
-            # Legacy: apply decay to additive scores
+            # Legacy: apply decay + importance to additive scores
             for item in results.values():
-                item["score"] *= item["decay_factor"]
+                item["score"] *= item["decay_factor"] * item["importance_boost"]
             ranked = sorted(results.values(), key=lambda x: x["score"], reverse=True)[:limit * 2]
 
         # Stage 4.3 (optional): Temporal-index hard filter.
@@ -2332,6 +2731,55 @@ class Recall:
             except Exception as e:
                 LOG(f"MMR diversify failed, using original order: {e}")
 
+        # v10 — Smart query router. For relational questions ("who worked
+        # on X with Y", "связь между X и Y"), inject knowledge rows reached
+        # via the episodic graph alongside the regular hybrid hits. The
+        # classifier is heuristic (no LLM call) so this is cheap on every
+        # query. The classification metadata propagates into the response
+        # so callers can see which path produced the result.
+        router_classification = None
+        try:
+            import query_router as _qr_router
+            router_classification = _qr_router.classify_query(query)
+            if (router_classification.kind == "relational"
+                    and router_classification.entities):
+                graph_rows = _qr_router.graph_search(
+                    self.s.db,
+                    entities=router_classification.entities,
+                    project=project,
+                    limit=max(5, limit),
+                )
+                if graph_rows:
+                    existing_ids = {item["r"]["id"] for item in ranked}
+                    base_score = (
+                        max((it.get("rrf_score", it.get("score", 0))
+                             for it in ranked), default=0.0)
+                        if ranked else 1.0
+                    )
+                    boost = float(
+                        os.environ.get("MEMORY_RELATIONAL_BOOST", "1.3")
+                    )
+                    for row in graph_rows:
+                        rid_g = row.get("id")
+                        if rid_g in existing_ids:
+                            continue
+                        ranked.append({
+                            "r": row,
+                            "score": base_score * 0.6,
+                            "via": ["relational_router"],
+                            "rrf_score": base_score * boost * 0.6,
+                            "decay_factor": 1.0,
+                            "importance_boost": 1.0,
+                        })
+                    # Re-sort so the boosted relational rows compete fairly.
+                    ranked.sort(
+                        key=lambda x: x.get("rrf_score", x.get("score", 0)),
+                        reverse=True,
+                    )
+                    ranked = ranked[:limit]
+        except Exception as e:
+            LOG(f"smart router skipped: {e}")
+
         # Stage 6.5 (optional): Graph expansion — add 1-hop neighbours
         # of the top-K to help multi-hop questions. Neighbours get a
         # penalised score (0.5× min of the top score) so they never
@@ -2379,6 +2827,8 @@ class Recall:
             content = r["content"]
             context = r.get("context", "")
 
+            importance = (r.get("importance") or "medium").lower()
+
             if detail == "compact":
                 # ~50 tokens per result
                 entry = {
@@ -2386,6 +2836,7 @@ class Recall:
                     "title": content[:80] + ("..." if len(content) > 80 else ""),
                     "project": r.get("project", ""),
                     "score": round(item["score"], 3),
+                    "importance": importance,
                     "created_at": r.get("created_at", ""),
                 }
                 if "rrf_score" in item:
@@ -2401,6 +2852,7 @@ class Recall:
                     "id": r["id"], "content": content, "context": context,
                     "project": r.get("project", ""), "tags": tags,
                     "confidence": r.get("confidence", 1.0),
+                    "importance": importance,
                     "created_at": r.get("created_at", ""), "session_id": r.get("session_id", ""),
                     "score": round(item["score"], 3), "via": item["via"],
                     "recall_count": r.get("recall_count", 0),
@@ -2417,6 +2869,7 @@ class Recall:
                     "id": r["id"], "content": content, "context": context,
                     "project": r.get("project", ""), "tags": tags,
                     "confidence": r.get("confidence", 1.0),
+                    "importance": importance,
                     "created_at": r.get("created_at", ""), "session_id": r.get("session_id", ""),
                     "score": round(item["score"], 3), "via": item["via"],
                     "recall_count": r.get("recall_count", 0),
@@ -2434,6 +2887,11 @@ class Recall:
                   "fusion": fusion, "total_tokens": total_tokens, "results": grouped}
         if use_rrf and tier_rankings:
             result["tiers_used"] = list(tier_rankings.keys())
+        if router_classification is not None:
+            result["routed_via"] = router_classification.kind
+            result["routed_signals"] = router_classification.signals
+            if router_classification.entities:
+                result["routed_entities"] = router_classification.entities
 
         # Cache the result
         if self.s.cache is not None:
@@ -2780,7 +3238,11 @@ async def list_tools():
         Tool(
             name="memory_save",
             description="Save knowledge explicitly. Types: decision (MUST include WHY in context), "
-                        "solution, lesson, fact, convention. Auto-dedup via Jaccard + fuzzy similarity.",
+                        "solution, lesson, fact, convention. Auto-dedup via Jaccard + fuzzy similarity. "
+                        "v10: a quality gate scores the record before save; below-threshold records are "
+                        "rejected with a `rejected_by_quality_gate: true` response (override with "
+                        "MEMORY_QUALITY_GATE_ENABLED=false). Use `importance` to surface critical "
+                        "decisions at recall time (boosts the final RRF score).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2792,6 +3254,16 @@ async def list_tools():
                     "branch": {"type": "string", "description": "Git branch this knowledge relates to"},
                     "filter": {"type": "string",
                                "description": "Optional content filter (pytest|cargo|git_status|docker_ps|generic_logs). Trims noisy CLI output while preserving URLs/paths/code."},
+                    "importance": {
+                        "type": "string",
+                        "enum": ["critical", "high", "medium", "low"],
+                        "default": "medium",
+                        "description": "Recall-time boost: critical x1.5, high x1.2, medium x1.0, low x0.8. Reserve `critical` for migration-blocking decisions and security incidents.",
+                    },
+                    "coref": {
+                        "type": "boolean",
+                        "description": "Opt into v10 coreference rewrite — expand pronouns ('after this it broke') into self-contained text using recent session history. Costs ~1s LLM round-trip; default off.",
+                    },
                 },
                 "required": ["content", "type"],
             },
@@ -2848,6 +3320,20 @@ async def list_tools():
                 "type": "object",
                 "properties": {
                     "dry_run": {"type": "boolean", "description": "If true, only show what would be affected", "default": True},
+                },
+            },
+        ),
+        Tool(
+            name="memory_wiki_generate",
+            description="v10 — Render the per-project wiki digest (top decisions, "
+                        "active solutions, conventions, recent changes) as Markdown. "
+                        "Pass `project` to refresh one wiki, omit it to refresh all "
+                        "active projects. Files land in <MEMORY_DIR>/wikis/<project>.md "
+                        "and are deterministic (no LLM call).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project to refresh (omit for all)"},
                 },
             },
         ),
@@ -3831,10 +4317,28 @@ async def _do(name, a):
         return J(recall.timeline(**kwargs))
 
     elif name == "memory_save":
-        rid, was_dedup, was_redacted, private_sections = store.save_knowledge(
+        rid, was_dedup, was_redacted, private_sections, quality_meta = store.save_knowledge(
             SID, a["content"], a["type"],
             a.get("project", "general"), a.get("tags", []), a.get("context", ""),
-            branch=a.get("branch", BRANCH), filter_name=a.get("filter"))
+            branch=a.get("branch", BRANCH), filter_name=a.get("filter"),
+            importance=a.get("importance", "medium"),
+            coref=a.get("coref"))
+        # v10 — quality gate dropped the record; surface the verdict so the
+        # caller can iterate on the content rather than silently losing it.
+        if rid is None:
+            verdict = quality_meta or {}
+            return J({
+                "saved": False,
+                "rejected_by_quality_gate": True,
+                "score": verdict.get("total"),
+                "threshold": verdict.get("threshold"),
+                "reason": verdict.get("reason"),
+                "axes": {
+                    "specificity": verdict.get("specificity"),
+                    "actionability": verdict.get("actionability"),
+                    "verifiability": verdict.get("verifiability"),
+                },
+            })
         # Invalidate cache on write
         if store.cache is not None:
             store.cache.invalidate(project=a.get("project"))
@@ -3846,6 +4350,8 @@ async def _do(name, a):
             result["privacy_redacted"] = True
         if private_sections:
             result["privacy_redacted_sections"] = private_sections
+        if quality_meta and quality_meta.get("decision") == "pass":
+            result["quality_score"] = quality_meta.get("total")
 
         # Auto-update SelfModel competencies for solution/lesson saves
         if a["type"] in ("solution", "lesson") and not was_dedup:
@@ -3879,11 +4385,11 @@ async def _do(name, a):
         old_rec = store.q1("SELECT * FROM knowledge WHERE id=?", (old["id"],))
         if not old_rec:
             return J({"error": "Record not found in DB"})
-        new_id, _, _, _ = store.save_knowledge(
+        new_id, _, _, _, _ = store.save_knowledge(
             SID, a["new_content"], old_rec["type"], old_rec["project"],
             json.loads(old_rec.get("tags", "[]")),
             f"Updated: {a.get('reason', '')}. Was: {old_rec['content'][:200]}",
-            branch=old_rec.get("branch", ""), skip_dedup=True)
+            branch=old_rec.get("branch", ""), skip_dedup=True, skip_quality=True)
         store.db.execute(
             "UPDATE knowledge SET status='superseded',superseded_by=? WHERE id=?",
             (new_id, old["id"]))
@@ -3940,6 +4446,30 @@ async def _do(name, a):
                        "knowledge_count": len(data["knowledge"]), "sessions_count": len(data["sessions"])})
         else:
             return J(data)
+
+    elif name == "memory_wiki_generate":
+        try:
+            import project_wiki as _pw
+        except Exception as e:
+            return J({"error": f"project_wiki module unavailable: {e}"})
+        out_dir = str(MEMORY_DIR / "wikis")
+        target = a.get("project")
+        if target:
+            res = _pw.generate_wiki(store.db, target, output_dir=out_dir)
+            if res is None:
+                return J({"saved": False, "project": target,
+                          "reason": "wiki disabled or no active records"})
+            return J({"saved": True, "project": res.project,
+                      "path": res.path, "chars": res.chars})
+        results = _pw.generate_all(store.db, output_dir=out_dir)
+        return J({
+            "saved": True,
+            "wiki_count": len(results),
+            "wikis": [
+                {"project": r.project, "path": r.path, "chars": r.chars}
+                for r in results
+            ],
+        })
 
     elif name == "memory_forget":
         dry_run = a.get("dry_run", True)
@@ -4173,12 +4703,12 @@ async def _do(name, a):
             a.get("view", "full_report"), a.get("project"), a.get("days", 30)))
 
     elif name == "self_reflect":
-        rid, _, _, _ = store.save_knowledge(
+        rid, _, _, _, _ = store.save_knowledge(
             SID, a["reflection"], "reflection",
             a.get("project", "general"),
             (a.get("tags") or []) + ["self-reflection", a.get("outcome", "success")],
             f"Task: {a['task_summary']}. Outcome: {a.get('outcome', 'success')}",
-            branch=BRANCH)
+            branch=BRANCH, skip_quality=True)
         return J({"saved": True, "id": rid, "type": "reflection"})
 
     elif name == "self_rules_context":

@@ -23,6 +23,32 @@ def _isolate_active_context_vault(tmp_path_factory, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _disable_quality_gate_in_tests(monkeypatch):
+    """Disable the v10 quality gate by default in the test suite.
+
+    Most existing integration tests seed records with deliberately synthetic
+    content ("A" * 400, "kubernetes operator pattern…") that the gate would
+    correctly reject as low-signal noise. Tests that exercise the gate
+    explicitly override `MEMORY_QUALITY_GATE_ENABLED=true` themselves.
+    """
+    monkeypatch.setenv("MEMORY_QUALITY_GATE_ENABLED", "false")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _disable_contradiction_detector_in_tests(monkeypatch):
+    """Disable v10 auto-contradiction detection by default in the test
+    suite. The detector spawns an LLM round-trip per same-type candidate
+    in the same project — fine in production, but we don't want fixture
+    saves in different tests cross-comparing each other or accidentally
+    talking to a half-configured provider. The dedicated detector tests
+    drive `detect_contradictions` directly; they don't need the hot-path
+    integration to fire."""
+    monkeypatch.setenv("MEMORY_CONTRADICTION_DETECT_ENABLED", "false")
+    yield
+
+
 @pytest.fixture
 def db():
     """In-memory SQLite database with all v5 tables."""

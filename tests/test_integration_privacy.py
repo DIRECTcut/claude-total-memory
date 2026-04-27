@@ -33,7 +33,7 @@ def _seed_session(s, sid="s1", project="demo"):
 
 def test_save_redacts_private_tag(store):
     _seed_session(store)
-    rid, _dup, _red, priv = store.save_knowledge(
+    rid, _dup, _red, priv, _qm = store.save_knowledge(
         sid="s1",
         content="hello <private>API_KEY=sk-xxx</private> world",
         ktype="fact",
@@ -51,7 +51,7 @@ def test_save_redacts_private_tag(store):
 
 def test_save_no_tag_no_redaction(store):
     _seed_session(store)
-    rid, _dup, _red, priv = store.save_knowledge(
+    rid, _dup, _red, priv, _qm = store.save_knowledge(
         sid="s1", content="plain content no secrets", ktype="fact", project="demo",
     )
     assert priv == 0
@@ -59,7 +59,7 @@ def test_save_no_tag_no_redaction(store):
 
 def test_save_multiple_tags_counter(store):
     _seed_session(store)
-    _rid, _dup, _red, priv = store.save_knowledge(
+    _rid, _dup, _red, priv, _qm = store.save_knowledge(
         sid="s1",
         content="a <private>s1</private> b <private>s2</private> c",
         ktype="fact",
@@ -88,7 +88,7 @@ def test_private_redactions_total_counter(store):
 def test_mcp_memory_save_exposes_field(store):
     # Emulate the MCP handler result-building block around save_knowledge.
     _seed_session(store)
-    rid, was_dedup, was_redacted, private_sections = store.save_knowledge(
+    rid, was_dedup, was_redacted, private_sections, _qm = store.save_knowledge(
         "s1", "before <private>secret</private> after", "fact",
         "demo", [], "",
     )

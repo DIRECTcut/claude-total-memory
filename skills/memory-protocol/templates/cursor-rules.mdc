@@ -1,0 +1,58 @@
+---
+description: total-agent-memory protocol — recall before tasks, save after
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# Memory Protocol (total-agent-memory v10.5)
+
+You have access to a persistent cross-session memory via the
+`memory` MCP server. Knowledge survives between sessions and is
+shared across agents working on the same project.
+
+## The five non-negotiables
+
+1. **Session start → `session_init` first, then `memory_recall`.**
+2. **Before any non-trivial task → `memory_recall(query, project)`.**
+3. **After every significant action → `memory_save` immediately.**
+4. **On error / stuck → `learn_error` (or `self_error_log`).**
+5. **End of session → `session_end` with summary + next_steps + pitfalls.**
+
+## Save discipline
+
+```
+ЧТО:        one-line summary
+ПРОЕКТ:     project name
+ФАЙЛЫ:      absolute paths to the key files
+СТЕК:       language / framework / version
+ПОДХОД:     3–7 key steps
+НЮАНСЫ:     gotchas, edge cases
+```
+
+For decisions, add **WHY** (alternatives, trade-offs).
+
+Tags must include `["reusable", "<tech>"]` if the recipe applies elsewhere.
+
+## Recall discipline
+
+1. `memory_recall(query, project=<current>)` — current project first.
+2. Empty / contradicting → `analogize(text=query, exclude_project=...)`.
+3. Still empty → context7 / WebSearch / first principles.
+4. Never guess a convention you can recall.
+
+## Self-improvement
+
+- 3 identical errors → STOP. `memory_save(type='lesson', stuck=...)` +
+  ask the user with A/B/C options.
+- Reusable solution → `memory_save(tags=['reusable', ...])`.
+
+## Anti-patterns
+
+- Don't ask "should I save this?" — save without asking.
+- Don't batch saves until end of session — save now.
+- Don't recall and ignore — cite the id + 1-line gist before applying.
+- Don't save terminal dumps — distill to the digest above.
+- Don't guess a convention you can recall.
+
+For the full tool reference, hooks documentation, and per-IDE setup
+see `~/claude-memory-server/skills/memory-protocol/references/`.

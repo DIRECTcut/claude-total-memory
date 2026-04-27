@@ -44,11 +44,15 @@ class _FakeResp:
 
 
 def _capture_urlopen(payload: dict, sink: dict):
-    def fake(req, timeout=None):
+    # See note in test_embed_provider.py — production embed_provider
+    # passes context=ssl_context for certifi compatibility, so the
+    # mock has to accept it (and any forward-compatible kwargs).
+    def fake(req, timeout=None, *, context=None, **_kw):
         sink["url"] = req.full_url
         sink["headers"] = dict(req.headers)
         sink["body"] = json.loads(req.data.decode("utf-8")) if req.data else None
         sink["timeout"] = timeout
+        sink["context"] = context
         return _FakeResp(payload)
     return fake
 

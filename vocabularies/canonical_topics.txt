@@ -1,0 +1,86 @@
+# v10 — canonical topic vocabulary
+#
+# Lines starting with `#` are comments and ignored.
+# Each non-blank line is `canonical[, alias1, alias2, ...]`.
+# Aliases are case-insensitive substrings used by string-similarity matching
+# when no embedding model is available.
+#
+# Adding a new canonical: pick a single short kebab-case slug and list the
+# free-form variants you've seen leak in over time. Run the full test suite
+# after editing — the vocabulary loader checks for duplicate canonicals.
+#
+# Curated against the user's actual topic distribution as of 2026-04-27
+# (see DECISION 3823 / 3828, vitamin_all DB audit, claude-total-memory
+# release history). Bias: skew toward topics that already showed tag drift
+# in MCP memory ("optimization-plan" / "audit" / "p0-deployed" all collapse
+# into `database` + `performance`).
+
+# ── Storage / data layer ────────────────────────
+database, db, storage, dbal, sqlite
+postgres, pgsql, postgresql, pg
+azure-sql, mssql, sql-server, t-sql, tsql
+migration, migrations, schema-change, alembic, doctrine-migration
+performance, perf, optimization, query-tuning, slow-query
+indexing, indices, btree, gin, fulltext
+
+# ── Backend stacks ──────────────────────────────
+golang, go, go-lang, go1
+php, symfony, laravel, php-fpm
+python, py, python3
+nodejs, node, node-js, typescript-node
+api, rest, http-api, json-api
+graphql, gql, graphql-api
+messaging, queue, rabbitmq, amqp, kafka, sqs
+async, async-io, asyncio, coroutines
+
+# ── Frontend ────────────────────────────────────
+frontend, fe, ui, web-ui
+vue, vuejs, vue3, nuxt, nuxt3, nuxt4
+react, reactjs, jsx, nextjs
+typescript, ts, tsx
+tailwind, tailwindcss, css
+build-tool, vite, webpack, esbuild
+
+# ── Infra / ops ─────────────────────────────────
+docker, docker-compose, dockerfile, container
+kubernetes, k8s, helm, kubectl
+deploy, deployment, release, rollout
+ci-cd, ci, cd, github-actions, gitlab-ci, pipeline
+hosting, vps, shared-hosting, siteground, hetzner
+monitoring, observability, metrics, prometheus, grafana
+logging, structured-logging, log-aggregation
+networking, dns, tls, ssl, certificate
+
+# ── Security ────────────────────────────────────
+security, sec, hardening, owasp, vulnerability
+auth, authentication, authorization, oauth, jwt, sso
+secrets, credentials, key-management, vault
+privacy, gdpr, pii, redaction
+
+# ── Tooling / process ───────────────────────────
+git, vcs, branching, commit, merge, rebase
+testing, tests, unit-tests, pytest, phpunit, integration-tests
+refactor, refactoring, cleanup, code-smell
+debug, debugging, root-cause, troubleshooting
+documentation, docs, readme, changelog
+incident, outage, postmortem, retrospective
+
+# ── AI / agent ecosystem ────────────────────────
+claude-code, claude, anthropic-cli
+codex, openai-codex, codex-cli
+mcp, model-context-protocol, mcp-server, mcp-tool
+hooks, hook, claude-hooks, lifecycle-hooks
+skills, skill, agent-skill
+a2a, inter-agent, agent-to-agent
+prompt, prompting, prompt-engineering, system-prompt
+embedding, embeddings, vector-search, semantic-search
+rag, retrieval-augmented-generation
+llm, large-language-model, gpt, gemini, ollama
+memory, knowledge-base, kb, agent-memory
+
+# ── Workflow / project mgmt ─────────────────────
+planning, plan, roadmap, milestone
+sync, synchronization, ingestion, etl
+architecture, design, system-design, arch
+convention, style-guide, coding-standard
+bbcode, markup, formatting

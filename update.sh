@@ -129,7 +129,10 @@ elif [[ -n "${UPDATE_URL:-}" ]]; then
 
     # Verify SHA-256
     actual=$(/usr/bin/shasum -a 256 "$tmpdir/update.tar.gz" | awk '{print $1}')
-    if [[ "${actual,,}" != "${UPDATE_URL_SHA256,,}" ]]; then
+    # Lowercase via tr for bash 3.2 compat (macOS default — no ${var,,})
+    actual_lc=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+    expected_lc=$(printf '%s' "$UPDATE_URL_SHA256" | tr '[:upper:]' '[:lower:]')
+    if [ "$actual_lc" != "$expected_lc" ]; then
       rm -rf "$tmpdir"
       fail "SHA-256 mismatch: expected $UPDATE_URL_SHA256, got $actual"
     fi

@@ -51,7 +51,7 @@ def test_search_returns_multi_repr_hits_after_reflection(store, monkeypatch):
         "handles failover, master election, and backup scheduling automatically. "
         "Deployment happens via Helm charts with values for different environments."
     )
-    rid, _, _, _ = store.save_knowledge(
+    rid, *_save = store.save_knowledge(
         sid="s1", content=long_content, ktype="solution", project="demo"
     )
 

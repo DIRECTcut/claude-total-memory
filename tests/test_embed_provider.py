@@ -31,11 +31,16 @@ class _FakeResp:
 
 
 def _capture_urlopen(payload: dict, sink: dict):
-    def fake(req, timeout=None):
+    # Accept and discard `context=` (production callers may pass an
+    # SSL context kwarg for certifi-based fixes); accept any other
+    # forward-compatible kwargs so tests don't break when callers
+    # adopt new urllib options.
+    def fake(req, timeout=None, *, context=None, **_kw):
         sink["url"] = req.full_url
         sink["headers"] = dict(req.headers)
         sink["body"] = json.loads(req.data.decode("utf-8")) if req.data else None
         sink["timeout"] = timeout
+        sink["context"] = context
         return _FakeResp(payload)
     return fake
 

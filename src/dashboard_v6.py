@@ -75,6 +75,104 @@ def api_v6_queues(db: sqlite3.Connection) -> dict:
     return out
 
 
+def api_v10_enrichment_queue(db: sqlite3.Connection) -> dict:
+    """v10.1 — Health snapshot of the async enrichment queue.
+
+    Used by the dashboard panel that shows operators when the worker
+    is falling behind or repeatedly failing on the same content.
+    """
+    out: dict = {
+        "status_counts": {"pending": 0, "processing": 0, "done": 0, "failed": 0},
+        "throughput_per_min": 0.0,
+        "p50_ms_per_task": None,
+        "p95_ms_per_task": None,
+        "oldest_pending_age_sec": None,
+        "recent_failures": [],
+    }
+    try:
+        for r in db.execute(
+            "SELECT status, COUNT(*) AS c FROM enrichment_queue GROUP BY status"
+        ).fetchall():
+            out["status_counts"][r["status"]] = r["c"]
+    except sqlite3.Error:
+        out["error"] = "enrichment_queue table missing"
+        return out
+
+    # Recent throughput: rows finished in the last minute.
+    try:
+        row = db.execute(
+            "SELECT COUNT(*) AS c FROM enrichment_queue "
+            "WHERE status='done' "
+            "  AND finished_at > datetime('now', '-60 seconds')"
+        ).fetchone()
+        out["throughput_per_min"] = float(row["c"]) if row else 0.0
+    except sqlite3.Error:
+        pass
+
+    # Latency percentiles over the last 100 completed rows.
+    try:
+        # SQLite has no julianday-based ms diff in one expression that
+        # is fully portable; compute in Python on a small window.
+        rows = db.execute(
+            "SELECT started_at, finished_at FROM enrichment_queue "
+            "WHERE status='done' AND started_at IS NOT NULL "
+            "  AND finished_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 100"
+        ).fetchall()
+        from datetime import datetime
+        durations: list[float] = []
+        for r in rows:
+            try:
+                t0 = datetime.fromisoformat((r["started_at"] or "").replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat((r["finished_at"] or "").replace("Z", "+00:00"))
+                durations.append((t1 - t0).total_seconds() * 1000)
+            except Exception:
+                continue
+        if durations:
+            durations.sort()
+            out["p50_ms_per_task"] = round(durations[len(durations) // 2])
+            p95_idx = max(0, int(len(durations) * 0.95) - 1)
+            out["p95_ms_per_task"] = round(durations[p95_idx])
+    except sqlite3.Error:
+        pass
+
+    # Age of oldest pending row — early-warning signal that the worker
+    # is stuck or disabled.
+    try:
+        row = db.execute(
+            "SELECT enqueued_at FROM enrichment_queue "
+            "WHERE status='pending' ORDER BY enqueued_at ASC LIMIT 1"
+        ).fetchone()
+        if row and row["enqueued_at"]:
+            from datetime import datetime, timezone
+            t0 = datetime.fromisoformat(row["enqueued_at"].replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - t0).total_seconds()
+            out["oldest_pending_age_sec"] = round(age)
+    except sqlite3.Error:
+        pass
+
+    # Last 5 failures so operators can spot recurring stage errors.
+    try:
+        out["recent_failures"] = [
+            {
+                "id": r["id"],
+                "knowledge_id": r["knowledge_id"],
+                "attempts": r["attempts"],
+                "last_error": (r["last_error"] or "")[:200],
+                "finished_at": r["finished_at"],
+            }
+            for r in db.execute(
+                "SELECT id, knowledge_id, attempts, last_error, finished_at "
+                "FROM enrichment_queue WHERE status='failed' "
+                "ORDER BY id DESC LIMIT 5"
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        pass
+
+    return out
+
+
 def api_v6_coverage(db: sqlite3.Connection) -> dict:
     """Percent of active knowledge records that have v6 data attached."""
     try:
@@ -353,15 +451,20 @@ V6_PANELS_HTML = r"""
     <h3 style="margin:0 0 8px 0;font-size:14px;color:#8ad;">📊 v6 coverage</h3>
     <div id="v6-coverage-body" style="font-size:12px;color:#ccc;">loading...</div>
   </div>
+  <div class="v6-card" style="grid-column:1/-1;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:12px;">
+    <h3 style="margin:0 0 8px 0;font-size:14px;color:#8ad;">⚡ v10.1 enrichment worker</h3>
+    <div id="v10-enrich-body" style="font-size:12px;color:#ccc;">loading...</div>
+  </div>
 </section>
 <script>
 (function() {
   async function refreshV6() {
     try {
-      const [savings, queues, coverage] = await Promise.all([
+      const [savings, queues, coverage, enrich] = await Promise.all([
         fetch('/api/v6/savings').then(r => r.json()),
         fetch('/api/v6/queues').then(r => r.json()),
         fetch('/api/v6/coverage').then(r => r.json()),
+        fetch('/api/v10/enrichment-queue').then(r => r.json()).catch(() => null),
       ]);
 
       // Savings panel
@@ -416,6 +519,44 @@ V6_PANELS_HTML = r"""
           bar(rpct, '#4a9') +
           `<div style="font-size:11px;">enrichment: ${epct}%</div>` +
           bar(epct, '#8ad');
+      }
+
+      // v10.1 enrichment worker panel
+      const eBody = document.getElementById('v10-enrich-body');
+      if (eBody && enrich) {
+        const sc = enrich.status_counts || {};
+        const pend = sc.pending || 0, proc = sc.processing || 0;
+        const done = sc.done || 0, failed = sc.failed || 0;
+        const ageColor = enrich.oldest_pending_age_sec > 60 ? '#fa0'
+                         : enrich.oldest_pending_age_sec > 10 ? '#ea5' : '#4a9';
+        const pendColor = pend > 50 ? '#f55' : (pend > 10 ? '#fa0' : '#4a9');
+        const tput = (enrich.throughput_per_min || 0).toFixed(1);
+        const p50 = enrich.p50_ms_per_task != null ? `${enrich.p50_ms_per_task}ms` : '—';
+        const p95 = enrich.p95_ms_per_task != null ? `${enrich.p95_ms_per_task}ms` : '—';
+        const age = enrich.oldest_pending_age_sec != null
+                    ? `${enrich.oldest_pending_age_sec}s`
+                    : '—';
+        let html = `<div style="display:flex;gap:18px;flex-wrap:wrap;">
+          <div><span style="color:${pendColor};">●</span> <b>${pend}</b> pending</div>
+          <div><span style="color:#888;">●</span> ${proc} processing</div>
+          <div><span style="color:#4a9;">●</span> ${done} done</div>
+          <div><span style="color:${failed>0?'#f55':'#666'};">●</span> ${failed} failed</div>
+          <div style="margin-left:auto;color:#888;">throughput ${tput}/min</div>
+          <div style="color:#888;">p50 ${p50} · p95 ${p95}</div>
+          <div style="color:${ageColor};">oldest pending ${age}</div>
+        </div>`;
+        if (enrich.recent_failures && enrich.recent_failures.length) {
+          html += `<details style="margin-top:8px;font-size:11px;color:#aaa;">
+            <summary style="cursor:pointer;color:#f55;">recent failures (${enrich.recent_failures.length})</summary>`;
+          enrich.recent_failures.forEach(f => {
+            html += `<div style="margin:4px 0 0 12px;">id=${f.id} kid=${f.knowledge_id}
+              attempts=${f.attempts}<br/><code style="color:#ea7;">${f.last_error}</code></div>`;
+          });
+          html += `</details>`;
+        }
+        eBody.innerHTML = html;
+      } else if (eBody) {
+        eBody.innerHTML = '<div style="color:#666;">enrichment_queue not available (set MEMORY_ASYNC_ENRICHMENT=true)</div>';
       }
     } catch (e) {
       console.error('v6 refresh failed', e);

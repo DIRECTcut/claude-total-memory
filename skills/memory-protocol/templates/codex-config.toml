@@ -1,0 +1,22 @@
+# Append to ~/.codex/config.toml. The installer
+# (~/claude-memory-server/install.sh --ide codex) does this automatically.
+
+[mcp.servers.memory]
+command = "python3"
+args = ["-m", "claude_total_memory.cli", "serve", "--mode", "stdio"]
+
+[mcp.servers.memory.env]
+MEMORY_ASYNC_ENRICHMENT = "false"
+MEMORY_QUALITY_GATE_ENABLED = "auto"
+MEMORY_CONTRADICTION_DETECT_ENABLED = "auto"
+
+[hooks]
+SessionStart     = "~/.codex/hooks/session-start.sh"
+PreToolUse       = "~/.codex/hooks/pre-edit.sh"
+UserPromptSubmit = "~/.codex/hooks/user-prompt-submit.sh"
+Stop             = "~/.codex/hooks/on-stop.sh"
+BashErrorHook    = "~/.codex/hooks/on-bash-error.sh"
+
+# Optional — opt in if you want every tool call observed by the
+# reflection cycle. Cumulative cost (~30ms/call), so off by default.
+# PostToolUse    = "~/.codex/hooks/post-tool-use.sh"

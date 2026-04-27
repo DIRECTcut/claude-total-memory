@@ -5,10 +5,14 @@
 # Usage:
 #   bash install.sh                       # = --ide claude-code (default)
 #   bash install.sh --ide claude-code
+#   bash install.sh --ide codex
 #   bash install.sh --ide cursor
+#   bash install.sh --ide cline
+#   bash install.sh --ide continue
+#   bash install.sh --ide aider
+#   bash install.sh --ide windsurf
 #   bash install.sh --ide gemini-cli
 #   bash install.sh --ide opencode
-#   bash install.sh --ide codex
 #   bash install.sh --uninstall           # remove background services (per OS)
 #
 # Env:
@@ -57,10 +61,10 @@ while [ $# -gt 0 ]; do
 done
 
 case "$IDE" in
-    claude-code|cursor|gemini-cli|opencode|codex) ;;
+    claude-code|cursor|gemini-cli|opencode|codex|cline|continue|aider|windsurf) ;;
     *)
         echo "ERROR: unsupported --ide value: $IDE" >&2
-        echo "Supported: claude-code, cursor, gemini-cli, opencode, codex" >&2
+        echo "Supported: claude-code, codex, cursor, cline, continue, aider, windsurf, gemini-cli, opencode" >&2
         exit 2
         ;;
 esac
@@ -575,6 +579,111 @@ register_mcp_opencode() {
     _json_merge_mcp "$HOME/.opencode/config.json" "mcp"
 }
 
+# v10.5 — Cline (VS Code extension)
+# Cline reads MCP config from VS Code user settings.json.
+register_mcp_cline() {
+    echo "-> Step 4: Configuring Cline (VS Code) MCP server..."
+    # Resolve VS Code user settings dir per OS
+    case "$OS_NAME" in
+        Darwin)  vscode_dir="$HOME/Library/Application Support/Code/User" ;;
+        Linux)   vscode_dir="$HOME/.config/Code/User" ;;
+        *)       vscode_dir="$HOME/.config/Code/User" ;;
+    esac
+    mkdir -p "$vscode_dir"
+    _json_merge_mcp_nested "$vscode_dir/settings.json" "cline.mcpServers"
+
+    # Per-project rules file (Cline auto-loads .clinerules/)
+    if [ -d "$INSTALL_DIR/skills/memory-protocol/templates" ]; then
+        echo "  Note: copy templates/cline-rules.md into your project's .clinerules/memory-protocol.md to activate the protocol."
+    fi
+}
+
+# v10.5 — Continue (VS Code / JetBrains extension)
+register_mcp_continue() {
+    echo "-> Step 4: Configuring Continue MCP server..."
+    local cont_dir="$HOME/.continue"
+    mkdir -p "$cont_dir/rules"
+    _json_merge_mcp "$cont_dir/config.json" "mcpServers"
+
+    # Install rules file
+    if [ -f "$INSTALL_DIR/skills/memory-protocol/SKILL.md" ]; then
+        cp "$INSTALL_DIR/skills/memory-protocol/SKILL.md" "$cont_dir/rules/memory-protocol.md"
+        echo "  OK: Rules installed to $cont_dir/rules/memory-protocol.md"
+    fi
+}
+
+# v10.5 — Aider (no MCP yet — bash bridge via .aider.conf.yml)
+register_mcp_aider() {
+    echo "-> Step 4: Configuring Aider memory bridge..."
+    local aider_conf="$HOME/.aider.conf.yml"
+    local skill_path="$INSTALL_DIR/skills/memory-protocol/SKILL.md"
+
+    if [ ! -f "$skill_path" ]; then
+        echo "  WARN: skill SKILL.md missing — bridge incomplete"
+        return 0
+    fi
+
+    # Append a 'read:' entry without clobbering user config.
+    if [ -f "$aider_conf" ] && grep -q "memory-protocol/SKILL.md" "$aider_conf"; then
+        echo "  OK: Aider already configured to read memory-protocol skill"
+    else
+        {
+            [ -s "$aider_conf" ] && echo ""
+            echo "# --- total-agent-memory v10.5 (memory bridge) ---"
+            echo "read:"
+            echo "  - $skill_path"
+            echo "# --- end total-agent-memory ---"
+        } >> "$aider_conf"
+        echo "  OK: Appended skill reference to $aider_conf"
+    fi
+    echo "  Note: Aider has no MCP yet. Use bash bridges:"
+    echo "        ~/claude-memory-server/ollama/lookup_memory.sh \"<query>\""
+}
+
+# v10.5 — Windsurf (Codeium IDE)
+register_mcp_windsurf() {
+    echo "-> Step 4: Configuring Windsurf MCP server..."
+    local ws_dir="$HOME/.codeium/windsurf"
+    mkdir -p "$ws_dir"
+    _json_merge_mcp "$ws_dir/mcp_config.json" "mcpServers"
+
+    if [ -f "$INSTALL_DIR/skills/memory-protocol/templates/cursor-rules.mdc" ]; then
+        echo "  Note: paste templates/cursor-rules.mdc body into project .windsurfrules to activate the protocol."
+    fi
+}
+
+# v10.5 — JSON merge for nested mcpServers under a dotted key (e.g. cline.mcpServers).
+_json_merge_mcp_nested() {
+    local CFG="$1"
+    local NESTED_KEY="$2"
+    mkdir -p "$(dirname "$CFG")"
+    [ -f "$CFG" ] || echo '{}' > "$CFG"
+    CFG_PATH="$CFG" NESTED_KEY="$NESTED_KEY" PY_PATH="$PY_PATH" SRV_PATH="$SRV_PATH" \
+    MEMORY_DIR="$MEMORY_DIR" python3 - <<'PY'
+import json, os, sys
+cfg_path = os.environ['CFG_PATH']
+nested = os.environ['NESTED_KEY']  # e.g. "cline.mcpServers"
+parts = nested.split('.')
+try:
+    with open(cfg_path) as f:
+        s = json.load(f)
+except Exception:
+    s = {}
+node = s
+for p in parts[:-1]:
+    node = node.setdefault(p, {})
+node.setdefault(parts[-1], {})
+node[parts[-1]]['memory'] = {
+    "command": os.environ['PY_PATH'],
+    "args": [os.environ['SRV_PATH']],
+    "env": {"CLAUDE_MEMORY_DIR": os.environ['MEMORY_DIR']},
+}
+with open(cfg_path, 'w') as f:
+    json.dump(s, f, indent=2)
+print(f"  OK: MCP config written to {cfg_path} under {nested}")
+PY
+}
+
 register_mcp_codex() {
     echo "-> Step 4: Configuring Codex CLI MCP server..."
     local codex_dir="$HOME/.codex"
@@ -656,7 +765,42 @@ case "$IDE" in
     gemini-cli)  register_mcp_gemini_cli ;;
     opencode)    register_mcp_opencode ;;
     codex)       register_mcp_codex ;;
+    cline)       register_mcp_cline ;;
+    continue)    register_mcp_continue ;;
+    aider)       register_mcp_aider ;;
+    windsurf)    register_mcp_windsurf ;;
 esac
+
+# v10.5 — Universal skill installation. The memory-protocol skill is
+# the same content for every IDE (only the wiring differs). Copy it
+# into the right location per IDE so the agent surfaces it.
+if [ -d "$INSTALL_DIR/skills/memory-protocol" ]; then
+    case "$IDE" in
+        claude-code)
+            skill_target="$HOME/.claude/skills/memory-protocol"
+            ;;
+        codex)
+            skill_target="$HOME/.codex/skills/memory-protocol"
+            ;;
+        opencode)
+            skill_target="$HOME/.opencode/skills/memory-protocol"
+            ;;
+        *)
+            # Cursor / Cline / Continue / Aider / Windsurf / Gemini-CLI
+            # don't have a skill API — protocol is loaded via rules file
+            # by their respective register_mcp_* function above.
+            skill_target=""
+            ;;
+    esac
+    if [ -n "$skill_target" ]; then
+        echo "-> Step 4d: Installing memory-protocol skill to $skill_target ..."
+        mkdir -p "$skill_target/references" "$skill_target/templates"
+        cp "$INSTALL_DIR/skills/memory-protocol/SKILL.md" "$skill_target/SKILL.md"
+        cp "$INSTALL_DIR/skills/memory-protocol/references/"*.md "$skill_target/references/" 2>/dev/null || true
+        cp "$INSTALL_DIR/skills/memory-protocol/templates/"* "$skill_target/templates/" 2>/dev/null || true
+        echo "  OK: skill v10.5 installed"
+    fi
+fi
 
 # -- 4c. Ollama check + optional install prompt --
 echo ""
@@ -786,6 +930,48 @@ print('  OK: MCP server configured in $CFG')
             echo "  FAIL: MCP config issue ($CFG)"
         fi
         ;;
+    cline)
+        case "$OS_NAME" in
+            Darwin) CFG="$HOME/Library/Application Support/Code/User/settings.json" ;;
+            *)      CFG="$HOME/.config/Code/User/settings.json" ;;
+        esac
+        CLINE_CFG="$CFG" python3 -c "
+import json, os
+cfg = os.environ['CLINE_CFG']
+with open(cfg) as f:
+    s = json.load(f)
+assert 'memory' in s.get('cline', {}).get('mcpServers', {})
+print('  OK: MCP server configured in', cfg)
+" 2>/dev/null || echo "  FAIL: MCP config issue ($CFG)"
+        ;;
+    continue)
+        CFG="$HOME/.continue/config.json"
+        python3 -c "
+import json
+with open('$CFG') as f:
+    s = json.load(f)
+assert 'memory' in s.get('mcpServers', {})
+print('  OK: MCP server configured in $CFG')
+" 2>/dev/null || echo "  FAIL: MCP config issue ($CFG)"
+        ;;
+    aider)
+        CFG="$HOME/.aider.conf.yml"
+        if grep -q "memory-protocol/SKILL.md" "$CFG" 2>/dev/null; then
+            echo "  OK: Aider memory bridge wired in $CFG"
+        else
+            echo "  FAIL: Aider memory bridge missing"
+        fi
+        ;;
+    windsurf)
+        CFG="$HOME/.codeium/windsurf/mcp_config.json"
+        python3 -c "
+import json
+with open('$CFG') as f:
+    s = json.load(f)
+assert 'memory' in s.get('mcpServers', {})
+print('  OK: MCP server configured in $CFG')
+" 2>/dev/null || echo "  FAIL: MCP config issue ($CFG)"
+        ;;
 esac
 
 if [ -d "$MEMORY_DIR" ]; then
@@ -832,6 +1018,26 @@ case "$IDE" in
     codex)
         echo "  Codex CLI now has persistent memory."
         echo "  Start 'codex' as usual — type /mcp to verify."
+        ;;
+    cline)
+        echo "  Cline (VS Code) now has persistent memory."
+        echo "  Reload VS Code — Cline picks up cline.mcpServers from settings.json."
+        echo "  Add .clinerules/memory-protocol.md to each project to load the protocol."
+        ;;
+    continue)
+        echo "  Continue now has persistent memory."
+        echo "  Restart your IDE — Continue auto-loads ~/.continue/config.json."
+        ;;
+    aider)
+        echo "  Aider now reads the memory-protocol skill at startup."
+        echo "  No MCP — use bash bridges:"
+        echo "    ~/claude-memory-server/ollama/lookup_memory.sh \"<query>\""
+        echo "    ~/claude-memory-server/ollama/save_memory.sh --type ... --content ..."
+        ;;
+    windsurf)
+        echo "  Windsurf now has persistent memory."
+        echo "  Restart Windsurf — it loads ~/.codeium/windsurf/mcp_config.json."
+        echo "  Paste templates/cursor-rules.mdc body into project .windsurfrules."
         ;;
 esac
 echo ""
